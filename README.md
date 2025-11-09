@@ -99,6 +99,24 @@ python quag_bruteforce.py --ciphertext RIJVSUYVJN --wordlist-inline KEY --no-aut
 
 Disabling autokey can speed up searches when you know the cipher was strictly Quagmire/Beaufort.
 
+## Debugging without the CLI
+
+If you prefer to step through the solver inside an IDE, use the companion script
+`vscode_debug.py`.  It imports the same `run_search` function as the CLI but
+pulls its inputs from a small configuration dictionary instead of parsing
+arguments.
+
+1. Open `vscode_debug.py` and adjust the paths or inline strings in
+   `DEBUG_CONFIG` to match your ciphertext and word lists.  By default it reads
+   the bundled 370k wordlist and evaluates the first 200 entries.
+2. Launch the script under the Visual Studio Code debugger (or run
+   `python vscode_debug.py` from a terminal).  Set breakpoints anywhere inside
+   `quag_bruteforce.py`; they will trigger exactly as they do for the CLI.
+
+The script automatically enables `multiprocessing.freeze_support()` so spawned
+workers behave on Windows the same way they do when the CLI runs from the
+command line.
+
 ## Tips
 
 * The solver filters candidates whose plaintext preview starts with any entry from the optional two-letter list.
@@ -111,6 +129,6 @@ Disabling autokey can speed up searches when you know the cipher was strictly Qu
 
 * **"Error loading ..."** – ensure exactly one of the inline or file flags is provided for each input.
 * **No results** – try removing the two-letter filter, expanding the wordlist, or enabling autokey modes.
-* **Slow progress** – increase the update interval to reduce console noise, bump `--workers` to parallelise the search, or narrow the key index range.
+* **Slow progress** – increase the update interval to reduce console noise, bump `--workers` to parallelise the search, or narrow the key index range.  On Windows, the solver now uses the `spawn` multiprocessing context and preloads shared data so multi-worker runs keep updating the dashboard instead of stalling at zero combos.
 
 For deeper inspection or to integrate the solver into your own tooling, read through `quag_bruteforce.py`.

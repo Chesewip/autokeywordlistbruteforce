@@ -13,10 +13,11 @@ import argparse
 import concurrent.futures
 import itertools
 import math
+import multiprocessing
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 BASE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 ENGLISH_FREQ = [
@@ -49,6 +50,9 @@ ENGLISH_FREQ = [
 ]
 IOC_TARGET = 0.066
 TARGET_COMBOS_PER_CHUNK = 250_000
+
+
+_WORKER_CONTEXT: Dict[str, Any] | None = None
 
 
 def clean_text_letters(text: str) -> str:
@@ -484,8 +488,7 @@ def evaluate_key_word(
     return local_results, combos_tried, autokey_attempts
 
 
-def _process_key_chunk(
-    key_chunk: Sequence[str],
+def _init_worker_context(
     cipher: str,
     alph_candidates: Sequence[Dict[str, object]],
     families: Sequence[
@@ -502,12 +505,44 @@ def _process_key_chunk(
     max_results: int,
     have_first2_filter: bool,
     have_second4_filter: bool,
-) -> Tuple[List[Dict[str, object]], int, int, int]:
-    """Worker helper that evaluates a chunk of keys."""
+) -> None:
+    """Initialise global worker context for spawned processes."""
+
+    global _WORKER_CONTEXT
+    _WORKER_CONTEXT = {
+        "cipher": cipher,
+        "alph_candidates": tuple(alph_candidates),
+        "families": tuple(families),
+        "two_letter_set": frozenset(two_letter_set),
+        "four_letter_set": frozenset(four_letter_set),
+        "preview_length": preview_length,
+        "include_autokey": include_autokey,
+        "max_results": max_results,
+        "have_first2_filter": have_first2_filter,
+        "have_second4_filter": have_second4_filter,
+    }
+
+
+def _process_key_chunk(key_chunk: Sequence[str]) -> Tuple[List[Dict[str, object]], int, int, int]:
+    """Worker helper that evaluates a chunk of keys using shared context."""
+
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("Worker context not initialised")
 
     chunk_results: List[Dict[str, object]] = []
     chunk_combos = 0
     chunk_autokey_attempts = 0
+
+    two_letter_set = _WORKER_CONTEXT["two_letter_set"]
+    four_letter_set = _WORKER_CONTEXT["four_letter_set"]
+    alph_candidates = _WORKER_CONTEXT["alph_candidates"]
+    families = _WORKER_CONTEXT["families"]
+    preview_length = int(_WORKER_CONTEXT["preview_length"])
+    include_autokey = bool(_WORKER_CONTEXT["include_autokey"])
+    max_results = int(_WORKER_CONTEXT["max_results"])
+    have_first2_filter = bool(_WORKER_CONTEXT["have_first2_filter"])
+    have_second4_filter = bool(_WORKER_CONTEXT["have_second4_filter"])
+    cipher = str(_WORKER_CONTEXT["cipher"])
 
     for key_word in key_chunk:
         key_results, combos, autokey_attempts = evaluate_key_word(
@@ -642,46 +677,54 @@ def run_search(
 
         chunk_iter = _iter_chunks(key_subset, chunk_size)
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-            pending: Set[concurrent.futures.Future] = set()
+        if sys.platform == "win32":
+            mp_context = multiprocessing.get_context("spawn")
+        else:
+            mp_context = multiprocessing.get_context()
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp_context,
+            initializer=_init_worker_context,
+            initargs=(
+                cipher,
+                alph_candidates,
+                families,
+                two_letter_set,
+                four_letter_set,
+                preview_length,
+                include_autokey,
+                max_results,
+                have_first2_filter,
+                have_second4_filter,
+            ),
+        ) as executor:
+            pending_futures: Dict[concurrent.futures.Future, int] = {}
 
             def submit_next_chunk() -> bool:
                 try:
                     next_chunk = next(chunk_iter)
                 except StopIteration:
                     return False
-                future = executor.submit(
-                    _process_key_chunk,
-                    next_chunk,
-                    cipher,
-                    alph_candidates,
-                    families,
-                    two_letter_set,
-                    four_letter_set,
-                    preview_length,
-                    include_autokey,
-                    max_results,
-                    have_first2_filter,
-                    have_second4_filter,
-                )
-                pending.add(future)
-                stats["keys_inflight"] += len(next_chunk)
+                future = executor.submit(_process_key_chunk, next_chunk)
+                chunk_len = len(next_chunk)
+                pending_futures[future] = chunk_len
+                stats["keys_inflight"] += chunk_len
                 return True
 
             for _ in range(worker_count):
                 if not submit_next_chunk():
                     break
 
-            while pending:
+            while pending_futures:
                 timeout = update_interval if update_interval > 0 else None
                 done, not_done = concurrent.futures.wait(
-                    pending,
+                    set(pending_futures),
                     timeout=timeout,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
 
                 if not done:
-                    pending = not_done
+                    pending_futures = {f: pending_futures[f] for f in not_done}
                     now = time.perf_counter()
                     if update_interval > 0 and now - last_update >= update_interval:
                         elapsed = now - start_time
@@ -690,17 +733,22 @@ def run_search(
                         last_update = now
                     continue
 
-                pending = not_done
                 for future in done:
-                    chunk_results, chunk_combos, chunk_autokey_attempts, chunk_keys = future.result()
+                    chunk_keys = pending_futures.pop(future, 0)
+                    stats["keys_inflight"] -= chunk_keys
+                    try:
+                        chunk_results, chunk_combos, chunk_autokey_attempts, processed_keys = future.result()
+                    except Exception:
+                        for remaining in pending_futures:
+                            remaining.cancel()
+                        raise
                     stats["combos_tried"] += chunk_combos
                     stats["autokey_attempts"] += chunk_autokey_attempts
-                    stats["keys_inflight"] -= chunk_keys
-                    stats["keys_processed"] += chunk_keys
+                    stats["keys_processed"] += processed_keys
                     for candidate in chunk_results:
                         maintain_top_results(results, candidate, max_results)
 
-                while len(pending) < worker_count and submit_next_chunk():
+                while len(pending_futures) < worker_count and submit_next_chunk():
                     pass
 
                 now = time.perf_counter()
@@ -833,4 +881,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    multiprocessing.freeze_support()
     sys.exit(main())
