@@ -1,15 +1,56 @@
 # Quagmire III Wordlist Bruteforcer (CLI)
 
 This repository packages a terminal version of the Quagmire III wordlist solver that originally shipped as a browser tool (`quagmire_3_wordlist_solver (1).html`).
-The Python script `quag_bruteforce.py` reproduces the keyed alphabet enumeration, cipher family decryptors (Vigenère, Beaufort, variant Beaufort, and their autokey variants),
-and the scoring heuristics used by the HTML worker. Use it to explore candidate plaintexts directly from your shell.
+Both a Python script (`quag_bruteforce.py`) and a standalone C++ implementation (`quag_bruteforce.cpp`) reproduce the keyed alphabet enumeration,
+cipher family decryptors (Vigenère, Beaufort, variant Beaufort, and their autokey variants), and the scoring heuristics used by the HTML worker.
+Use them to explore candidate plaintexts directly from your shell or deploy them on bare-bones machines.
+
+## C++ command-line solver
+
+The new `quag_bruteforce.cpp` binary is designed for fast, multi-threaded searches on systems where Python is undesirable or unavailable.
+
+### Build
+
+Compile with any C++17-compatible compiler. Example using `g++`:
+
+```bash
+g++ -std=c++17 -O3 -pthread -o quag_bruteforce_cpp quag_bruteforce.cpp
+```
+
+### Usage
+
+```bash
+./quag_bruteforce_cpp \
+    --ciphertext RIJVSUYVJN \
+    --wordlist-inline $'KEY\nLEMON\nALPHA' \
+    --two-letter-inline HE \
+    --threads 4 \
+    --max-results 25
+```
+
+Key flags:
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--ciphertext` / `--ciphertext-file` | Provide the ciphertext inline or via file. |
+| `--wordlist-inline` / `--wordlist` | Main wordlist (required). |
+| `--two-letter-inline` / `--two-letter-list` | Optional two-letter filter list. |
+| `--threads` | Number of worker threads (default: hardware concurrency). |
+| `--include-autokey` | Enable autokey variants in addition to the repeating-key modes. |
+| `--max-results` | Maximum ranked candidates to keep (default: 50). |
+| `--preview-length` | Number of plaintext characters to display for each candidate (default: 80). |
+| `--progress-interval` | Seconds between progress updates (set `--quiet` to suppress). |
+
+The tool mirrors the browser worker’s behaviour: it enumerates keyed alphabets in both forward and reversed forms,
+tests the Vigenère, Beaufort, and variant Beaufort families, applies optional structural filters (two-letter start and 4-letter second word),
+and ranks candidates using an IoC/χ² blend. Progress updates stream to stderr while the ranked table prints to stdout when the search finishes.
 
 ## Requirements
 
 * Python 3.8 or newer
 * A wordlist of candidate keys (one per line, uppercase recommended but not required)
 
-The script has no third-party dependencies.
+The Python script has no third-party dependencies.
 
 ## Getting Started
 
