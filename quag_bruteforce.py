@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import itertools
 import math
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 BASE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 ENGLISH_FREQ = [
@@ -47,6 +48,7 @@ ENGLISH_FREQ = [
     0.00074,
 ]
 IOC_TARGET = 0.066
+TARGET_COMBOS_PER_CHUNK = 250_000
 
 
 def clean_text_letters(text: str) -> str:
@@ -325,7 +327,8 @@ class LiveRenderer:
         best_score = max((cand["score"] for cand in results), default=0.0)
 
         lines = []
-        lines.append(
+        keys_inflight = int(stats.get("keys_inflight", 0))
+        keys_line = (
             "Workers: {workers}  Keys: {processed}/{total_keys}  Combos: {combos}/{total_combos}  "
             "Autokey attempts: {autokey}".format(
                 workers=worker_count,
@@ -336,6 +339,9 @@ class LiveRenderer:
                 autokey=autokey_attempts,
             )
         )
+        if keys_inflight:
+            keys_line += f" (+{keys_inflight} in-flight)"
+        lines.append(keys_line)
         lines.append(
             f"{progress_bar}  {progress_ratio * 100:5.1f}%  elapsed {format_duration(elapsed_seconds)}"
         )
@@ -525,6 +531,15 @@ def _process_key_chunk(
     return chunk_results, chunk_combos, chunk_autokey_attempts, len(key_chunk)
 
 
+def _iter_chunks(seq: Sequence[str], chunk_size: int) -> Iterable[Sequence[str]]:
+    iterator = iter(seq)
+    while True:
+        chunk = list(itertools.islice(iterator, chunk_size))
+        if not chunk:
+            break
+        yield chunk
+
+
 def run_search(
     ciphertext: str,
     words: Sequence[str],
@@ -580,6 +595,7 @@ def run_search(
         "autokey_attempts": 0,
         "worker_count": worker_count,
         "keys_processed": 0,
+        "keys_inflight": 0,
     }
 
     last_update = time.perf_counter()
@@ -614,17 +630,29 @@ def run_search(
                 renderer.render(stats, results)
                 last_update = now
     else:
-        chunk_size = max(1, math.ceil(len(key_subset) / (worker_count * 4)))
-        key_chunks = [
-            key_subset[idx : idx + chunk_size]
-            for idx in range(0, len(key_subset), chunk_size)
-        ]
+        combos_per_key = len(alph_candidates) * len(families)
+        approx_work_per_key = combos_per_key * (2 if include_autokey else 1)
+        chunk_size_by_work = max(
+            1,
+            TARGET_COMBOS_PER_CHUNK
+            // max(1, approx_work_per_key),
+        )
+        chunk_size_by_keys = max(1, math.ceil(len(key_subset) / (worker_count * 8)))
+        chunk_size = max(1, min(chunk_size_by_work, chunk_size_by_keys))
+
+        chunk_iter = _iter_chunks(key_subset, chunk_size)
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
+            pending: Set[concurrent.futures.Future] = set()
+
+            def submit_next_chunk() -> bool:
+                try:
+                    next_chunk = next(chunk_iter)
+                except StopIteration:
+                    return False
+                future = executor.submit(
                     _process_key_chunk,
-                    chunk,
+                    next_chunk,
                     cipher,
                     alph_candidates,
                     families,
@@ -636,19 +664,24 @@ def run_search(
                     have_first2_filter,
                     have_second4_filter,
                 )
-                for chunk in key_chunks
-            ]
+                pending.add(future)
+                stats["keys_inflight"] += len(next_chunk)
+                return True
 
-            pending = set(futures)
+            for _ in range(worker_count):
+                if not submit_next_chunk():
+                    break
+
             while pending:
                 timeout = update_interval if update_interval > 0 else None
-                done, pending = concurrent.futures.wait(
+                done, not_done = concurrent.futures.wait(
                     pending,
                     timeout=timeout,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
 
                 if not done:
+                    pending = not_done
                     now = time.perf_counter()
                     if update_interval > 0 and now - last_update >= update_interval:
                         elapsed = now - start_time
@@ -657,13 +690,18 @@ def run_search(
                         last_update = now
                     continue
 
+                pending = not_done
                 for future in done:
                     chunk_results, chunk_combos, chunk_autokey_attempts, chunk_keys = future.result()
                     stats["combos_tried"] += chunk_combos
                     stats["autokey_attempts"] += chunk_autokey_attempts
+                    stats["keys_inflight"] -= chunk_keys
                     stats["keys_processed"] += chunk_keys
                     for candidate in chunk_results:
                         maintain_top_results(results, candidate, max_results)
+
+                while len(pending) < worker_count and submit_next_chunk():
+                    pass
 
                 now = time.perf_counter()
                 if update_interval == 0 or now - last_update >= update_interval:

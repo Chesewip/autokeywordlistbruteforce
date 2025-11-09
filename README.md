@@ -63,6 +63,7 @@ optional arguments:
 
 * While the search runs the solver continuously refreshes a progress dashboard on stderr. It includes a progress bar, live statistics, and the current top 50 candidates (or fewer if `--max-results` is lower).
 * Adjust `--update-interval` to control how frequently the dashboard refreshes. Setting it to `0` forces an update after every chunk of work.
+* When multiprocessing is enabled the dashboard shows how many keys are currently "in flight" across workers (for example `(+16 in-flight)`). The scheduler automatically breaks the wordlist into bite-sized chunks so progress updates continue to arrive even when keyed alphabet enumeration is extremely large.
 * Once the search completes, a final summary is printed to stderr and the same ranked candidate table is emitted to stdout so you can pipe it to other tools.
   Columns include the cipher mode, key word, alphabet word (and whether it was reversed), the first two plaintext letters, and a preview of the plaintext.
 
