@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Quagmire III Wordlist Solver</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #eee;
+    }
+
+    h1 {
+      text-align: center;
+      margin-top: 16px;
+      font-size: 1.6rem;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto 32px auto;
+      padding: 16px;
+    }
+
+    .flex-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .panel {
+      background: #181818;
+      border-radius: 8px;
+      padding: 12px;
+      flex: 1 1 300px;
+      box-shadow: 0 0 0 1px #222;
+    }
+
+    .panel h2 {
+      font-size: 1rem;
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      background: #101010;
+      color: #f3f3f3;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 8px;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 0.85rem;
+      resize: vertical;
+    }
+
+    label {
+      font-size: 0.85rem;
+      display: block;
+      margin-top: 4px;
+      margin-bottom: 4px;
+    }
+
+    input[type="number"],
+    input[type="text"] {
+      width: 100%;
+      padding: 4px 6px;
+      border-radius: 4px;
+      border: 1px solid #333;
+      background: #101010;
+      color: #f3f3f3;
+      font-size: 0.85rem;
+      box-sizing: border-box;
+    }
+
+    .controls {
+      margin-top: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+
+    #startBtn {
+      background: #2e7d32;
+      color: white;
+    }
+
+    #startBtn:disabled {
+      background: #204523;
+      cursor: default;
+    }
+
+    #stopBtn {
+      background: #c62828;
+      color: white;
+    }
+
+    #stopBtn:disabled {
+      background: #5f2525;
+      cursor: default;
+    }
+
+    #testBtn {
+      background: #0277bd;
+      color: white;
+    }
+
+    #status {
+      font-size: 0.8rem;
+      margin-top: 8px;
+      white-space: pre-line;
+    }
+
+    .results-panel {
+      margin-top: 16px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+
+    thead {
+      background: #202020;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    th,
+    td {
+      padding: 4px 6px;
+      border-bottom: 1px solid #222;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      font-weight: 600;
+    }
+
+    tbody tr:nth-child(even) {
+      background: #141414;
+    }
+
+    tbody tr:nth-child(odd) {
+      background: #101010;
+    }
+
+    .mono {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      white-space: nowrap;
+    }
+
+    .plaintext-preview {
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      white-space: pre-wrap;
+      max-height: 4.5em;
+      overflow: hidden;
+    }
+
+    .small-note {
+      font-size: 0.75rem;
+      color: #aaa;
+      margin-top: 4px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 0.65rem;
+      background: #333;
+      color: #eee;
+      margin-left: 4px;
+    }
+
+    .badge.rev {
+      background: #3949ab;
+    }
+
+    .badge.fwd {
+      background: #00897b;
+    }
+  </style>
+</head>
+<body>
+  <h1>Quagmire III Wordlist Solver</h1>
+  <div class="container">
+    <div class="flex-row">
+      <div class="panel">
+        <h2>Ciphertext</h2>
+        <label for="ciphertext">Ciphertext (letters A–Z; other chars will be stripped)</label>
+        <textarea id="ciphertext" placeholder="Paste ciphertext here..."></textarea>
+      </div>
+
+      <div class="panel">
+        <h2>Wordlists</h2>
+        <label for="wordlist">Main wordlist (one word per line) – used as BOTH Vigenère key and alphabet-key source.</label>
+        <textarea id="wordlist" placeholder="e.g.&#10;THEGIANT&#10;SECRET&#10;..."></textarea>
+        <label for="wordlistFile" class="small-note" style="margin-top:4px;">
+          Or load main wordlist from .txt file (one word per line):
+        </label>
+        <input type="file" id="wordlistFile" accept=".txt" />
+
+        <label for="twoLetterList" style="margin-top:8px;">
+          2-letter words list (one per line). Only candidates whose first 2 letters form a word in this list will be kept.
+        </label>
+        <textarea
+          id="twoLetterList"
+          style="min-height: 80px;"
+          placeholder="e.g.&#10;IT&#10;TO&#10;IN&#10;IS&#10;WE"
+        ></textarea>
+        <label for="twoLetterFile" class="small-note" style="margin-top:4px;">
+          Or load 2-letter word list from .txt file:
+        </label>
+        <input type="file" id="twoLetterFile" accept=".txt" />
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Search Settings</h2>
+      <div class="flex-row">
+        <div style="flex: 1 1 180px;">
+          <label for="maxResults">Max best results to keep</label>
+          <input type="number" id="maxResults" value="50" min="1" max="500" />
+        </div>
+        <div style="flex: 1 1 180px;">
+          <label for="updateInterval">Progress update interval (ms)</label>
+          <input type="number" id="updateInterval" value="750" min="100" />
+        </div>
+        <div style="flex: 1 1 180px;">
+          <label for="numWorkers">Number of workers</label>
+          <input type="number" id="numWorkers" value="1" min="1" max="16" />
+        </div>
+      </div>
+
+      <div class="small-note">
+        Encryption model: Vigenère over a custom alphabet; the same keyed alphabet is used for ciphertext, plaintext, and key.<br />
+        <span class="mono">C = (P_index + K_index) mod 26</span> over indices in the custom alphabet.
+      </div>
+
+      <div class="controls">
+        <button id="startBtn">Start Search</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <button id="testBtn" type="button">Load Test Case</button>
+        <div id="status">Status: idle.</div>
+      </div>
+    </div>
+
+    <div class="panel results-panel">
+      <h2>Best Candidates</h2>
+      <div class="small-note">
+        Sorted by a combined score: IoC is primary, with χ² acting as a weighted quality factor (bad χ² can drag down even a strong IoC).
+        When both structural filters are available, candidates are kept only if their first 2 letters match your 2-letter list AND the next 4 letters (positions 3–6, i.e. the second word when the first word is 2 letters) form a 4-letter word from the main wordlist.
+      </div>
+      <div style="overflow: auto; max-height: 420px; margin-top: 8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Score<br /><span class="small-note">(IoC/χ² mix)</span></th>
+              <th>IoC</th>
+              <th>χ²</th>
+              <th>Key / Mode</th>
+              <th>Alphabet key</th>
+              <th>First 2</th>
+              <th>Plaintext preview</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Worker code embedded in-page -->
+  <script id="quag-worker" type="javascript/worker">
+    // Worker scope code
+    const BASE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const ENGLISH_FREQ = [
+      0.08167, 0.01492, 0.02782, 0.04253, 0.12702, 0.02228,
+      0.02015, 0.06094, 0.06966, 0.00153, 0.00772, 0.04025,
+      0.02406, 0.06749, 0.07507, 0.01929, 0.00095, 0.05987,
+      0.06327, 0.09056, 0.02758, 0.00978, 0.02360, 0.00150,
+      0.01974, 0.00074
+    ];
+
+    const IOC_TARGET = 0.066;
+
+    let cancelRequested = false;
+
+    function scorePlaintext(text) {
+      const ioc = indexOfCoincidence(text);
+      const chi = chiSquare(text);
+      const iocDelta = Math.abs(ioc - IOC_TARGET);
+      const iocScore = Math.max(0, 1 - iocDelta / 0.02);
+      const chiClamped = Math.min(chi, 400);
+      const chiScore = Math.max(0, 1 - chiClamped / 400);
+      const qualityFactor = 0.1 + 0.9 * chiScore;
+      const score = iocScore * qualityFactor;
+      return { score: score, ioc: ioc, chi: chi };
+    }
+
+    function cleanTextLetters(str) {
+      return (str || "").toUpperCase().replace(/[^A-Z]/g, "");
+    }
+
+    function parseWordlist(str) {
+      // Split on newline (LF, char code 10) to avoid any regex or escape issues.
+      const lines = (str || "").split(String.fromCharCode(10));
+      const words = [];
+      for (let i = 0; i < lines.length; i++) {
+        const w = cleanTextLetters(lines[i]);
+        if (w.length > 0) {
+          words.push(w);
+        }
+      }
+      return words;
+    }
+
+
+    function parseTwoLetterList(str) {
+      // Split on newline (LF, char code 10) to avoid any regex or escape issues.
+      const lines = (str || "").split(String.fromCharCode(10));
+      const set = new Set();
+      for (let i = 0; i < lines.length; i++) {
+        const w = cleanTextLetters(lines[i]);
+        if (w.length === 2) {
+          set.add(w);
+        }
+      }
+      return set;
+    }
+
+
+    function buildFourLetterSetFromWords(words) {
+      const fourSet = new Set();
+      for (let i = 0; i < words.length; i++) {
+        const w = words[i];
+        if (w.length === 4) {
+          fourSet.add(w);
+        }
+      }
+      return fourSet;
+    }
+
+    function buildKeyedAlphabet(word) {
+      const seen = new Set();
+      let head = "";
+      for (let i = 0; i < word.length; i++) {
+        const ch = word[i];
+        if (!seen.has(ch)) {
+          seen.add(ch);
+          head += ch;
+        }
+      }
+      for (let i = 0; i < BASE_ALPHABET.length; i++) {
+        const ch = BASE_ALPHABET[i];
+        if (!seen.has(ch)) {
+          head += ch;
+        }
+      }
+      return head;
+    }
+
+    // Vigenère-style decryption over a custom alphabet.
+    // Same alphabet is used for ciphertext, plaintext, and key.
+    // C = P + K (mod 26) => P = C - K (mod 26).
+    function decryptQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const k = key[i % keyLen];
+        const cIdx = alphabet.indexOf(c);
+        const kIdx = alphabet.indexOf(k);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (cIdx - kIdx + 26) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Helper used only for tests: encrypt using the same model (repeating-key Vigenère).
+    function encryptQuag3(plain, key, alphabet) {
+      const n = plain.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const p = plain[i];
+        const k = key[i % keyLen];
+        const pIdx = alphabet.indexOf(p);
+        const kIdx = alphabet.indexOf(k);
+        if (pIdx === -1 || kIdx === -1) {
+          result += p;
+          continue;
+        }
+        const cIdx = (pIdx + kIdx) % 26;
+        result += alphabet[cIdx];
+      }
+      return result;
+    }
+
+    // Autokey (running-key) decryption over the same custom alphabet.
+    // Keystream = key followed by plaintext.
+    function decryptAutokeyQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const cIdx = alphabet.indexOf(c);
+        let kChar;
+        if (i < keyLen) {
+          kChar = key[i];
+        } else {
+          kChar = result[i - keyLen];
+        }
+        const kIdx = alphabet.indexOf(kChar);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (cIdx - kIdx + 26) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Autokey (running-key) encryption for tests.
+    function encryptAutokeyQuag3(plain, key, alphabet) {
+      const n = plain.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const p = plain[i];
+        let kChar;
+        if (i < keyLen) {
+          kChar = key[i];
+        } else {
+          kChar = plain[i - keyLen];
+        }
+        const pIdx = alphabet.indexOf(p);
+        const kIdx = alphabet.indexOf(kChar);
+        if (pIdx === -1 || kIdx === -1) {
+          result += p;
+          continue;
+        }
+        const cIdx = (pIdx + kIdx) % 26;
+        result += alphabet[cIdx];
+      }
+      return result;
+    }
+
+    // Beaufort-style decryption over a custom alphabet.
+    // Classical Beaufort: C = K - P (mod 26) => P = K - C (mod 26).
+    function decryptBeaufortQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const cIdx = alphabet.indexOf(c);
+        const k = key[i % keyLen];
+        const kIdx = alphabet.indexOf(k);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (kIdx - cIdx + 26) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Variant Beaufort decryption over a custom alphabet.
+    // One common variant: C = P - K (mod 26) => P = C + K (mod 26).
+    function decryptVariantBeaufortQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const cIdx = alphabet.indexOf(c);
+        const k = key[i % keyLen];
+        const kIdx = alphabet.indexOf(k);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (cIdx + kIdx) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Autokey Beaufort: keystream = key followed by plaintext; P = K - C.
+    function decryptAutokeyBeaufortQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const cIdx = alphabet.indexOf(c);
+        let kChar;
+        if (i < keyLen) {
+          kChar = key[i];
+        } else {
+          kChar = result[i - keyLen];
+        }
+        const kIdx = alphabet.indexOf(kChar);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (kIdx - cIdx + 26) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Autokey variant Beaufort: keystream = key followed by plaintext; P = C + K.
+    function decryptAutokeyVariantBeaufortQuag3(cipher, key, alphabet) {
+      const n = cipher.length;
+      const keyLen = key.length;
+      if (n === 0 || keyLen === 0) return "";
+      let result = "";
+      for (let i = 0; i < n; i++) {
+        const c = cipher[i];
+        const cIdx = alphabet.indexOf(c);
+        let kChar;
+        if (i < keyLen) {
+          kChar = key[i];
+        } else {
+          kChar = result[i - keyLen];
+        }
+        const kIdx = alphabet.indexOf(kChar);
+        if (cIdx === -1 || kIdx === -1) {
+          result += c;
+          continue;
+        }
+        const pIdx = (cIdx + kIdx) % 26;
+        result += alphabet[pIdx];
+      }
+      return result;
+    }
+
+    // Sanity test #1: standard Vigenère over A-Z.
+    (function () {
+      const alphabet = BASE_ALPHABET;
+      const key = "KEY";
+      const cipher = "RIJVSUYVJN";
+      const expected = "HELLOWORLD";
+      const got = decryptQuag3(cipher, key, alphabet);
+      if (got !== expected) {
+        console.error("decryptQuag3 sanity test 1 failed", { expected: expected, got: got });
+      }
+    })();
+
+    // Sanity test #2: custom keyed alphabet should round-trip with our encrypt/decrypt.
+    (function () {
+      const alphabet = buildKeyedAlphabet("APPLE");
+      const key = "KEY";
+      const plain = "HELLOWORLD";
+      const cipher = encryptQuag3(plain, key, alphabet);
+      const got = decryptQuag3(cipher, key, alphabet);
+      if (got !== plain) {
+        console.error("decryptQuag3 sanity test 2 failed", { plain: plain, cipher: cipher, got: got, alphabet: alphabet });
+      }
+    })();
+
+    // Sanity test #3: autokey round-trip with the same custom alphabet.
+    (function () {
+      const alphabet = buildKeyedAlphabet("APPLE");
+      const key = "KEY";
+      const plain = "HELLOWORLD";
+      const cipher = encryptAutokeyQuag3(plain, key, alphabet);
+      const got = decryptAutokeyQuag3(cipher, key, alphabet);
+      if (got !== plain) {
+        console.error("decryptAutokeyQuag3 sanity test failed", { plain: plain, cipher: cipher, got: got, alphabet: alphabet });
+      }
+    })();
+
+    function indexOfCoincidence(text) {
+      const n = text.length;
+      if (n <= 1) return 0;
+      const counts = new Array(26);
+      for (let i = 0; i < 26; i++) counts[i] = 0;
+      for (let i = 0; i < n; i++) {
+        const code = text.charCodeAt(i) - 65;
+        if (code >= 0 && code < 26) counts[code]++;
+      }
+      let sum = 0;
+      for (let i = 0; i < 26; i++) {
+        const c = counts[i];
+        sum += c * (c - 1);
+      }
+      return sum / (n * (n - 1));
+    }
+
+    function chiSquare(text) {
+      const n = text.length;
+      if (n === 0) return Infinity;
+      const counts = new Array(26);
+      for (let i = 0; i < 26; i++) counts[i] = 0;
+      for (let i = 0; i < n; i++) {
+        const code = text.charCodeAt(i) - 65;
+        if (code >= 0 && code < 26) counts[code]++;
+      }
+      let chi = 0;
+      for (let i = 0; i < 26; i++) {
+        const expected = n * ENGLISH_FREQ[i];
+        if (expected <= 0) continue;
+        const diff = counts[i] - expected;
+        chi += (diff * diff) / expected;
+      }
+      return chi;
+    }
+
+    function maintainTopResults(results, candidate, maxResults) {
+      if (results.length < maxResults) {
+        results.push(candidate);
+      } else {
+        let worstIndex = 0;
+        let worstScore = results[0].score;
+        for (let i = 1; i < results.length; i++) {
+          if (results[i].score < worstScore) {
+            worstScore = results[i].score;
+            worstIndex = i;
+          }
+        }
+        if (candidate.score > worstScore) {
+          results[worstIndex] = candidate;
+        }
+      }
+    }
+
+    onmessage = function (e) {
+      const data = e.data;
+      if (data.type === "start") {
+        cancelRequested = false;
+        const cipher = cleanTextLetters(data.ciphertext);
+        const words = parseWordlist(data.wordlist);
+        const twoLetterSet = parseTwoLetterList(data.twoLetterList);
+        const fourLetterSet = buildFourLetterSetFromWords(words);
+        const maxResults = data.maxResults || 50;
+        const updateInterval = data.updateInterval || 750;
+        const startKeyIndex = typeof data.startKeyIndex === "number" ? data.startKeyIndex : 0;
+        const endKeyIndex = typeof data.endKeyIndex === "number" ? data.endKeyIndex : words.length;
+
+        if (!cipher || words.length === 0) {
+          postMessage({
+            type: "error",
+            message: "Need ciphertext and at least one word in the wordlist."
+          });
+          return;
+        }
+
+        // Build set of alphabet candidates (forward & reversed)
+        const alphMap = new Map();
+        for (let i = 0; i < words.length; i++) {
+          const w = words[i];
+          const alpha = buildKeyedAlphabet(w);
+          if (!alphMap.has(alpha)) {
+            alphMap.set(alpha, { alphabet: alpha, baseWord: w, isReversed: false });
+          }
+          const revWord = w.split("").reverse().join("");
+          const revAlpha = buildKeyedAlphabet(revWord);
+          if (!alphMap.has(revAlpha)) {
+            alphMap.set(revAlpha, { alphabet: revAlpha, baseWord: w, isReversed: true });
+          }
+        }
+
+        const alphCandidates = Array.from(alphMap.values());
+        const totalKeys = words.length;
+        const localKeys = Math.max(0, endKeyIndex - startKeyIndex);
+        const totalAlphs = alphCandidates.length;
+        const modesPerKeyAlphabet = 3; // Vigenère, Beaufort, Beaufort-variant (repeating-key)
+        const totalCombos = localKeys * totalAlphs * modesPerKeyAlphabet;
+
+        postMessage({
+          type: "init",
+          cipherLength: cipher.length,
+          totalKeys: totalKeys,
+          totalAlphs: totalAlphs,
+          totalCombos: totalCombos
+        });
+
+        let results = [];
+        let combosTried = 0;
+        let keysTried = 0;
+        let lastUpdateTime = performance.now();
+        const startTime = lastUpdateTime;
+
+        const families = ["vig", "beau", "bvar"];
+
+        outerLoop: for (let ki = startKeyIndex; ki < endKeyIndex; ki++) {
+          if (cancelRequested) break outerLoop;
+          const keyWord = words[ki];
+
+          for (let ai = 0; ai < totalAlphs; ai++) {
+            if (cancelRequested) break outerLoop;
+            const alphInfo = alphCandidates[ai];
+            const alphabet = alphInfo.alphabet;
+
+            for (let fi = 0; fi < families.length; fi++) {
+              if (cancelRequested) break outerLoop;
+              const fam = families[fi];
+
+              let plaintextStd = "";
+              if (fam === "vig") {
+                plaintextStd = decryptQuag3(cipher, keyWord, alphabet);
+              } else if (fam === "beau") {
+                plaintextStd = decryptBeaufortQuag3(cipher, keyWord, alphabet);
+              } else if (fam === "bvar") {
+                plaintextStd = decryptVariantBeaufortQuag3(cipher, keyWord, alphabet);
+              }
+
+              combosTried++;
+
+              if (plaintextStd.length < 2) {
+                continue;
+              }
+
+              const first2 = plaintextStd.slice(0, 2);
+              const secondWord4 = plaintextStd.length >= 6 ? plaintextStd.slice(2, 6) : "";
+
+              const haveFirst2Filter = twoLetterSet.size > 0;
+              const haveSecond4Filter = fourLetterSet.size > 0 && secondWord4.length === 4;
+
+              if (haveFirst2Filter && !twoLetterSet.has(first2)) {
+                continue;
+              }
+              if (haveSecond4Filter && !fourLetterSet.has(secondWord4)) {
+                continue;
+              }
+
+              // Score base-mode plaintext.
+              const scoredStd = scorePlaintext(plaintextStd);
+              let modeStd = "Vig";
+              if (fam === "beau") {
+                modeStd = "Beaufort";
+              } else if (fam === "bvar") {
+                modeStd = "Beaufort var";
+              }
+
+              const candidateStd = {
+                score: scoredStd.score,
+                chi: scoredStd.chi,
+                ioc: scoredStd.ioc,
+                key: keyWord,
+                mode: modeStd,
+                alphabetWord: alphInfo.baseWord,
+                alphabetReversed: alphInfo.isReversed,
+                alphabetString: alphabet,
+                first2: first2,
+                plaintextPreview: plaintextStd.slice(0, 120)
+              };
+
+              maintainTopResults(results, candidateStd, maxResults);
+
+              // Autokey for same family (only if base passed structural filters).
+              let plaintextAuto = "";
+              if (fam === "vig") {
+                plaintextAuto = decryptAutokeyQuag3(cipher, keyWord, alphabet);
+              } else if (fam === "beau") {
+                plaintextAuto = decryptAutokeyBeaufortQuag3(cipher, keyWord, alphabet);
+              } else if (fam === "bvar") {
+                plaintextAuto = decryptAutokeyVariantBeaufortQuag3(cipher, keyWord, alphabet);
+              }
+
+              if (plaintextAuto.length >= 2) {
+                const first2Auto = plaintextAuto.slice(0, 2);
+                const secondWord4Auto = plaintextAuto.length >= 6 ? plaintextAuto.slice(2, 6) : "";
+
+                let passesAutokey = true;
+                if (haveFirst2Filter && !twoLetterSet.has(first2Auto)) {
+                  passesAutokey = false;
+                }
+                if (haveSecond4Filter && !fourLetterSet.has(secondWord4Auto)) {
+                  passesAutokey = false;
+                }
+
+                if (passesAutokey) {
+                  const scoredAuto = scorePlaintext(plaintextAuto);
+                  let modeAuto = "Vig autokey";
+                  if (fam === "beau") {
+                    modeAuto = "Beaufort autokey";
+                  } else if (fam === "bvar") {
+                    modeAuto = "Beaufort var autokey";
+                  }
+
+                  const candidateAuto = {
+                    score: scoredAuto.score,
+                    chi: scoredAuto.chi,
+                    ioc: scoredAuto.ioc,
+                    key: keyWord,
+                    mode: modeAuto,
+                    alphabetWord: alphInfo.baseWord,
+                    alphabetReversed: alphInfo.isReversed,
+                    alphabetString: alphabet,
+                    first2: first2Auto,
+                    plaintextPreview: plaintextAuto.slice(0, 120)
+                  };
+
+                  maintainTopResults(results, candidateAuto, maxResults);
+                }
+              }
+
+              const now = performance.now();
+              if (now - lastUpdateTime >= updateInterval) {
+                const sorted = results.slice().sort(function (a, b) { return b.score - a.score; });
+                lastUpdateTime = now;
+                postMessage({
+                  type: "progress",
+                  combosTried: combosTried,
+                  totalCombos: totalCombos,
+                  keysTried: ki - startKeyIndex + 1,
+                  totalKeys: localKeys,
+                  elapsedMs: now - startTime,
+                  best: sorted
+                });
+              }
+            }
+          }
+
+          keysTried = ki - startKeyIndex + 1;
+        }
+
+        const endTime = performance.now();
+        const finalSorted = results.slice().sort(function (a, b) { return b.score - a.score; });
+        postMessage({
+          type: cancelRequested ? "stopped" : "done",
+          combosTried: combosTried,
+          totalCombos: totalCombos,
+          keysTried: keysTried,
+          totalKeys: localKeys,
+          elapsedMs: endTime - startTime,
+          best: finalSorted
+        });
+      } else if (data.type === "stop") {
+        cancelRequested = true;
+      }
+    };
+  </script>
+
+  <!-- Main UI script -->
+  <script>
+    let workers = [];
+    let running = false;
+    let globalTotals = {
+      cipherLength: 0,
+      totalKeys: 0,
+      totalAlphs: 0,
+      totalCombos: 0
+    };
+    let workerStates = [];
+    let aggregatedResults = [];
+    let globalComboSeen = new Set();
+    let maxResultsGlobal = 50;
+    let startTimeGlobal = 0;
+
+    function createWorkerFromScript(scriptId) {
+      const blob = new Blob([document.getElementById(scriptId).textContent], {
+        type: "application/javascript"
+      });
+      const url = URL.createObjectURL(blob);
+      return new Worker(url);
+    }
+
+    function setRunning(isRunning) {
+      running = isRunning;
+      document.getElementById("startBtn").disabled = isRunning;
+      document.getElementById("stopBtn").disabled = !isRunning;
+    }
+
+    function formatMs(ms) {
+      const s = ms / 1000;
+      if (s < 60) return s.toFixed(1) + "s";
+      const m = Math.floor(s / 60);
+      const rem = s - m * 60;
+      return m + "m " + rem.toFixed(1) + "s";
+    }
+
+    function updateStatus(text) {
+      document.getElementById("status").textContent = text;
+    }
+
+    function renderResults(best) {
+      const tbody = document.getElementById("resultsBody");
+      tbody.innerHTML = "";
+      if (!best || best.length === 0) return;
+      best.forEach((item, idx) => {
+        const tr = document.createElement("tr");
+
+        const rankTd = document.createElement("td");
+        rankTd.textContent = idx + 1;
+        tr.appendChild(rankTd);
+
+        const scoreTd = document.createElement("td");
+        scoreTd.textContent = item.score.toFixed(2);
+        tr.appendChild(scoreTd);
+
+        const iocTd = document.createElement("td");
+        iocTd.textContent = item.ioc.toFixed(4);
+        tr.appendChild(iocTd);
+
+        const chiTd = document.createElement("td");
+        chiTd.textContent = item.chi.toFixed(2);
+        tr.appendChild(chiTd);
+
+        const keyTd = document.createElement("td");
+        keyTd.className = "mono";
+        let keyLabel = item.key || "";
+        if (item.mode) {
+          keyLabel += " (" + item.mode + ")";
+        }
+        keyTd.textContent = keyLabel;
+        tr.appendChild(keyTd);
+
+        const alphTd = document.createElement("td");
+        alphTd.className = "mono";
+        alphTd.textContent = item.alphabetWord || "(?)";
+        const badge = document.createElement("span");
+        badge.className = "badge " + (item.alphabetReversed ? "rev" : "fwd");
+        badge.textContent = item.alphabetReversed ? "reversed" : "forward";
+        alphTd.appendChild(badge);
+        if (item.alphabetString) {
+          const alphaDiv = document.createElement("div");
+          alphaDiv.className = "small-note mono";
+          alphaDiv.textContent = item.alphabetString;
+          alphTd.appendChild(alphaDiv);
+        }
+        tr.appendChild(alphTd);
+
+        const first2Td = document.createElement("td");
+        first2Td.className = "mono";
+        first2Td.textContent = item.first2 || "";
+        tr.appendChild(first2Td);
+
+        const previewTd = document.createElement("td");
+        previewTd.className = "plaintext-preview";
+        previewTd.textContent = item.plaintextPreview || "";
+        tr.appendChild(previewTd);
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    function cleanTextLettersMain(str) {
+      return (str || "").toUpperCase().replace(/[^A-Z]/g, "");
+    }
+
+    function parseWordlistMain(str) {
+      const lines = (str || "").split(/[\r\n]+/);
+      const words = [];
+      for (let line of lines) {
+        const w = cleanTextLettersMain(line);
+        if (w.length > 0) words.push(w);
+      }
+      return words;
+    }
+
+    function buildKeyedAlphabetMain(word) {
+      const BASE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const seen = new Set();
+      let head = "";
+      for (let ch of word) {
+        if (!seen.has(ch)) {
+          seen.add(ch);
+          head += ch;
+        }
+      }
+      for (let ch of BASE_ALPHABET) {
+        if (!seen.has(ch)) {
+          head += ch;
+        }
+      }
+      return head;
+    }
+
+    function buildAlphabetCandidatesMain(words) {
+      const alphMap = new Map();
+      for (let w of words) {
+        const alpha = buildKeyedAlphabetMain(w);
+        if (!alphMap.has(alpha)) {
+          alphMap.set(alpha, { alphabet: alpha, baseWord: w, isReversed: false });
+        }
+        const revWord = w.split("").reverse().join("");
+        const revAlpha = buildKeyedAlphabetMain(revWord);
+        if (!alphMap.has(revAlpha)) {
+          alphMap.set(revAlpha, { alphabet: revAlpha, baseWord: w, isReversed: true });
+        }
+      }
+      return Array.from(alphMap.values());
+    }
+
+    function maintainTopResultsMain(results, candidate, maxResults) {
+      if (results.length < maxResults) {
+        results.push(candidate);
+      } else {
+        let worstIndex = 0;
+        let worstScore = results[0].score;
+        for (let i = 1; i < results.length; i++) {
+          if (results[i].score < worstScore) {
+            worstScore = results[i].score;
+            worstIndex = i;
+          }
+        }
+        if (candidate.score > worstScore) {
+          results[worstIndex] = candidate;
+        }
+      }
+    }
+
+    function mergeResults(best) {
+      if (!best) return;
+      for (const cand of best) {
+        const alphaStr = cand.alphabetString || "";
+        const modeTag = cand.mode || "std";
+        const comboId = `${cand.key}||${alphaStr}|${cand.alphabetReversed ? "R" : "F"}|${modeTag}`;
+        if (globalComboSeen.has(comboId)) continue;
+        globalComboSeen.add(comboId);
+        maintainTopResultsMain(aggregatedResults, cand, maxResultsGlobal);
+      }
+    }
+
+    function recomputeGlobalProgressStatus() {
+      const totalCombosDone = workerStates.reduce((sum, s) => sum + (s.combosTried || 0), 0);
+      const totalKeysDone = workerStates.reduce((sum, s) => sum + (s.keysTried || 0), 0);
+      const elapsedMs = performance.now() - startTimeGlobal;
+      const pct = globalTotals.totalCombos > 0 ? (100 * totalCombosDone / globalTotals.totalCombos) : 0;
+      updateStatus(
+        `Running... Combos tried: ${totalCombosDone}/${globalTotals.totalCombos} ` +
+          `(${pct.toFixed(3)}%), Keys: ${totalKeysDone}/${globalTotals.totalKeys}, ` +
+          `Elapsed: ${formatMs(elapsedMs)}`
+      );
+      const sorted = aggregatedResults.slice().sort((a, b) => b.score - a.score);
+      renderResults(sorted);
+    }
+
+    console.log("Main UI script loaded");
+
+    window.addEventListener("DOMContentLoaded", () => {
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      const testBtn = document.getElementById("testBtn");
+      const wordlistFile = document.getElementById("wordlistFile");
+      const twoLetterFile = document.getElementById("twoLetterFile");
+
+      if (wordlistFile) {
+        wordlistFile.addEventListener("change", (e) => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            document.getElementById("wordlist").value = reader.result || "";
+          };
+          reader.readAsText(file);
+        });
+      }
+
+      if (twoLetterFile) {
+        twoLetterFile.addEventListener("change", (e) => {
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            document.getElementById("twoLetterList").value = reader.result || "";
+          };
+          reader.readAsText(file);
+        });
+      }
+
+      // Load a simple built-in test case to sanity check the pipeline
+      testBtn.addEventListener("click", () => {
+        console.log("Test button clicked");
+        const cipher = "RIJVSUYVJN"; // HELLOWORLD with key KEY over A-Z
+        const wordlist = "KEY"; // only one candidate key & alphabet word
+        const twoLetters = "HE"; // first two letters of expected plaintext
+
+        const ctEl = document.getElementById("ciphertext");
+        const wlEl = document.getElementById("wordlist");
+        const tlEl = document.getElementById("twoLetterList");
+        console.log("Before test case fill:", {
+          ciphertext: ctEl && ctEl.value,
+          wordlist: wlEl && wlEl.value,
+          twoLetterList: tlEl && tlEl.value
+        });
+
+        ctEl.value = cipher;
+        wlEl.value = wordlist;
+        tlEl.value = twoLetters;
+        document.getElementById("maxResults").value = 10;
+        document.getElementById("numWorkers").value = 1;
+
+        console.log("After test case fill:", {
+          ciphertext: ctEl && ctEl.value,
+          wordlist: wlEl && wlEl.value,
+          twoLetterList: tlEl && tlEl.value
+        });
+
+        updateStatus("Loaded test case: ciphertext RIJVSUYVJN, key/alphabet word KEY, expecting HELLOWORLD.");
+      });
+      });
+
+      startBtn.addEventListener("click", () => {
+        const ciphertext = document.getElementById("ciphertext").value;
+        const wordlist = document.getElementById("wordlist").value;
+        const twoLetterList = document.getElementById("twoLetterList").value;
+        const maxResults = parseInt(document.getElementById("maxResults").value || "50", 10);
+        const updateInterval = parseInt(document.getElementById("updateInterval").value || "750", 10);
+        const numWorkersInput = parseInt(document.getElementById("numWorkers").value || "1", 10);
+
+        if (!ciphertext.trim()) {
+          alert("Please paste ciphertext first.");
+          return;
+        }
+        if (!wordlist.trim()) {
+          alert("Please provide a main wordlist (at least one word).");
+          return;
+        }
+
+        const words = parseWordlistMain(wordlist);
+        if (words.length === 0) {
+          alert("Parsed wordlist is empty after cleaning.");
+          return;
+        }
+        const alphCandidates = buildAlphabetCandidatesMain(words);
+
+        globalTotals.cipherLength = cleanTextLettersMain(ciphertext).length;
+        globalTotals.totalKeys = words.length;
+        globalTotals.totalAlphs = alphCandidates.length;
+        const modesPerKeyAlphabet = 3; // Vig, Beaufort, Beaufort variant (repeating-key)
+        globalTotals.totalCombos = globalTotals.totalKeys * globalTotals.totalAlphs * modesPerKeyAlphabet;
+
+        maxResultsGlobal = maxResults;
+        aggregatedResults = [];
+        globalComboSeen = new Set();
+
+        let numWorkers = isNaN(numWorkersInput) ? 1 : numWorkersInput;
+        numWorkers = Math.max(1, Math.min(numWorkers, globalTotals.totalKeys));
+
+        workers.forEach((w) => {
+          try {
+            w.terminate();
+          } catch (e) {}
+        });
+        workers = [];
+        workerStates = [];
+
+        startTimeGlobal = performance.now()
