@@ -56,6 +56,7 @@ optional arguments:
   --end-key-index N          End index within the wordlist (exclusive).
   --preview-length N         Number of plaintext characters to show in the preview (default: 120).
   --no-autokey               Disable autokey-family decryptions.
+  --workers N                Number of worker processes to spawn (default: 1).
 ```
 
 ### Progress and Output
@@ -103,11 +104,12 @@ Disabling autokey can speed up searches when you know the cipher was strictly Qu
   If you do not provide a list, all candidates are considered.
 * Use `--start-key-index` and `--end-key-index` to split large wordlists across multiple runs or machines.
 * Increase `--preview-length` to inspect more plaintext without re-running the solver.
+* Bump `--workers` to take advantage of multiple CPU cores (values above your physical core count may slow things down).
 
 ## Troubleshooting
 
 * **"Error loading ..."** – ensure exactly one of the inline or file flags is provided for each input.
 * **No results** – try removing the two-letter filter, expanding the wordlist, or enabling autokey modes.
-* **Slow progress** – increase the update interval to reduce console noise, or narrow the key index range.
+* **Slow progress** – increase the update interval to reduce console noise, bump `--workers` to parallelise the search, or narrow the key index range.
 
 For deeper inspection or to integrate the solver into your own tooling, read through `quag_bruteforce.py`.

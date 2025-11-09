@@ -10,11 +10,12 @@ plaintexts, and prints the best-scoring matches.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 BASE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 ENGLISH_FREQ = [
@@ -290,6 +291,153 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m {remainder:.1f}s"
 
 
+def evaluate_key_word(
+    key_word: str,
+    cipher: str,
+    alph_candidates: Sequence[Dict[str, object]],
+    families: Sequence[
+        Tuple[
+            str,
+            Callable[[str, str, str], str],
+            Callable[[str, str, str], str],
+        ]
+    ],
+    two_letter_set: Set[str],
+    four_letter_set: Set[str],
+    preview_length: int,
+    include_autokey: bool,
+    max_results: int,
+    have_first2_filter: bool,
+    have_second4_filter: bool,
+) -> Tuple[List[Dict[str, object]], int, int]:
+    """Evaluate all alphabet/mode combinations for a single key word."""
+
+    local_results: List[Dict[str, object]] = []
+    combos_tried = 0
+    autokey_attempts = 0
+
+    for alph_info in alph_candidates:
+        alphabet = str(alph_info["alphabet"])
+        base_word = str(alph_info["base_word"])
+        is_reversed = bool(alph_info["is_reversed"])
+
+        for mode_name, decrypt_fn, autokey_fn in families:
+            plaintext_std = decrypt_fn(cipher, key_word, alphabet)
+            combos_tried += 1
+
+            if len(plaintext_std) < 2:
+                continue
+
+            first2 = plaintext_std[:2]
+            second_word4 = plaintext_std[2:6] if len(plaintext_std) >= 6 else ""
+
+            if have_first2_filter and first2 not in two_letter_set:
+                continue
+            if have_second4_filter and second_word4 not in four_letter_set:
+                continue
+
+            scored_std = score_plaintext(plaintext_std)
+            candidate_std = {
+                "score": scored_std["score"],
+                "chi": scored_std["chi"],
+                "ioc": scored_std["ioc"],
+                "key": key_word,
+                "mode": mode_name,
+                "alphabet_word": base_word,
+                "alphabet_reversed": is_reversed,
+                "alphabet_string": alphabet,
+                "first2": first2,
+                "plaintext_preview": plaintext_std[:preview_length],
+            }
+            maintain_top_results(local_results, candidate_std, max_results)
+
+            if include_autokey:
+                plaintext_auto = autokey_fn(cipher, key_word, alphabet)
+                autokey_attempts += 1
+
+                if len(plaintext_auto) < 2:
+                    continue
+
+                first2_auto = plaintext_auto[:2]
+                second_word4_auto = plaintext_auto[2:6] if len(plaintext_auto) >= 6 else ""
+
+                passes = True
+                if have_first2_filter and first2_auto not in two_letter_set:
+                    passes = False
+                if have_second4_filter and second_word4_auto not in four_letter_set:
+                    passes = False
+
+                if passes:
+                    scored_auto = score_plaintext(plaintext_auto)
+                    autokey_label = {
+                        "Vig": "Vig autokey",
+                        "Beaufort": "Beaufort autokey",
+                        "Beaufort var": "Beaufort var autokey",
+                    }[mode_name]
+                    candidate_auto = {
+                        "score": scored_auto["score"],
+                        "chi": scored_auto["chi"],
+                        "ioc": scored_auto["ioc"],
+                        "key": key_word,
+                        "mode": autokey_label,
+                        "alphabet_word": base_word,
+                        "alphabet_reversed": is_reversed,
+                        "alphabet_string": alphabet,
+                        "first2": first2_auto,
+                        "plaintext_preview": plaintext_auto[:preview_length],
+                    }
+                    maintain_top_results(local_results, candidate_auto, max_results)
+
+    return local_results, combos_tried, autokey_attempts
+
+
+def _process_key_chunk(
+    key_chunk: Sequence[str],
+    cipher: str,
+    alph_candidates: Sequence[Dict[str, object]],
+    families: Sequence[
+        Tuple[
+            str,
+            Callable[[str, str, str], str],
+            Callable[[str, str, str], str],
+        ]
+    ],
+    two_letter_set: Set[str],
+    four_letter_set: Set[str],
+    preview_length: int,
+    include_autokey: bool,
+    max_results: int,
+    have_first2_filter: bool,
+    have_second4_filter: bool,
+) -> Tuple[List[Dict[str, object]], int, int, int]:
+    """Worker helper that evaluates a chunk of keys."""
+
+    chunk_results: List[Dict[str, object]] = []
+    chunk_combos = 0
+    chunk_autokey_attempts = 0
+
+    for key_word in key_chunk:
+        key_results, combos, autokey_attempts = evaluate_key_word(
+            key_word=key_word,
+            cipher=cipher,
+            alph_candidates=alph_candidates,
+            families=families,
+            two_letter_set=two_letter_set,
+            four_letter_set=four_letter_set,
+            preview_length=preview_length,
+            include_autokey=include_autokey,
+            max_results=max_results,
+            have_first2_filter=have_first2_filter,
+            have_second4_filter=have_second4_filter,
+        )
+        chunk_combos += combos
+        chunk_autokey_attempts += autokey_attempts
+        for candidate in key_results:
+            maintain_top_results(chunk_results, candidate, max_results)
+
+    return chunk_results, chunk_combos, chunk_autokey_attempts, len(key_chunk)
+
+
 def run_search(
     ciphertext: str,
     words: Sequence[str],
@@ -300,6 +448,7 @@ def run_search(
     end_index: int,
     preview_length: int,
     include_autokey: bool,
+    workers: int,
 ) -> Tuple[List[Dict[str, object]], Dict[str, float | int]]:
     cipher = clean_text_letters(ciphertext)
     if not cipher:
@@ -333,6 +482,8 @@ def run_search(
     have_second4_filter = bool(four_letter_set)
 
     results: List[Dict[str, object]] = []
+    worker_count = max(1, workers)
+
     stats: Dict[str, float | int] = {
         "total_keys": total_keys,
         "keys_considered": len(key_subset),
@@ -340,83 +491,107 @@ def run_search(
         "total_combos": total_combos,
         "combos_tried": 0,
         "autokey_attempts": 0,
+        "worker_count": worker_count,
     }
 
     last_update = time.perf_counter()
     start_time = last_update
 
-    for key_word in key_subset:
-        for alph_info in alph_candidates:
-            alphabet = alph_info["alphabet"]  # type: ignore[index]
-            for mode_name, decrypt_fn, autokey_fn in families:
-                plaintext_std = decrypt_fn(cipher, key_word, alphabet)
-                stats["combos_tried"] += 1
+    if worker_count == 1:
+        for key_word in key_subset:
+            key_results, combos, autokey_attempts = evaluate_key_word(
+                key_word=key_word,
+                cipher=cipher,
+                alph_candidates=alph_candidates,
+                families=families,
+                two_letter_set=two_letter_set,
+                four_letter_set=four_letter_set,
+                preview_length=preview_length,
+                include_autokey=include_autokey,
+                max_results=max_results,
+                have_first2_filter=have_first2_filter,
+                have_second4_filter=have_second4_filter,
+            )
+            stats["combos_tried"] += combos
+            stats["autokey_attempts"] += autokey_attempts
+            for candidate in key_results:
+                maintain_top_results(results, candidate, max_results)
 
-                if len(plaintext_std) < 2:
+            now = time.perf_counter()
+            if update_interval == 0 or now - last_update >= update_interval:
+                elapsed = now - start_time
+                progress_pct = 100 * stats["combos_tried"] / total_combos if total_combos else 0.0
+                best_score = max((cand["score"] for cand in results), default=0.0)
+                print(
+                    f"Progress: {stats['combos_tried']}/{total_combos} combos "
+                    f"({progress_pct:.3f}%), elapsed {format_duration(elapsed)}, "
+                    f"best score {best_score:.3f}",
+                    file=sys.stderr,
+                )
+                last_update = now
+    else:
+        chunk_size = max(1, math.ceil(len(key_subset) / (worker_count * 4)))
+        key_chunks = [
+            key_subset[idx : idx + chunk_size]
+            for idx in range(0, len(key_subset), chunk_size)
+        ]
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _process_key_chunk,
+                    chunk,
+                    cipher,
+                    alph_candidates,
+                    families,
+                    two_letter_set,
+                    four_letter_set,
+                    preview_length,
+                    include_autokey,
+                    max_results,
+                    have_first2_filter,
+                    have_second4_filter,
+                )
+                for chunk in key_chunks
+            ]
+
+            pending = set(futures)
+            while pending:
+                timeout = update_interval if update_interval > 0 else None
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                if not done:
+                    now = time.perf_counter()
+                    if update_interval > 0 and now - last_update >= update_interval:
+                        elapsed = now - start_time
+                        progress_pct = (
+                            100 * stats["combos_tried"] / total_combos
+                            if total_combos
+                            else 0.0
+                        )
+                        best_score = max((cand["score"] for cand in results), default=0.0)
+                        print(
+                            f"Progress: {stats['combos_tried']}/{total_combos} combos "
+                            f"({progress_pct:.3f}%), elapsed {format_duration(elapsed)}, "
+                            f"best score {best_score:.3f}",
+                            file=sys.stderr,
+                        )
+                        last_update = now
                     continue
 
-                first2 = plaintext_std[:2]
-                second_word4 = plaintext_std[2:6] if len(plaintext_std) >= 6 else ""
-
-                if have_first2_filter and first2 not in two_letter_set:
-                    continue
-                if have_second4_filter and second_word4 not in four_letter_set:
-                    continue
-
-                scored_std = score_plaintext(plaintext_std)
-                candidate_std = {
-                    "score": scored_std["score"],
-                    "chi": scored_std["chi"],
-                    "ioc": scored_std["ioc"],
-                    "key": key_word,
-                    "mode": mode_name,
-                    "alphabet_word": alph_info["base_word"],
-                    "alphabet_reversed": alph_info["is_reversed"],
-                    "alphabet_string": alphabet,
-                    "first2": first2,
-                    "plaintext_preview": plaintext_std[:preview_length],
-                }
-                maintain_top_results(results, candidate_std, max_results)
-
-                if include_autokey:
-                    plaintext_auto = autokey_fn(cipher, key_word, alphabet)
-                    stats["autokey_attempts"] += 1
-
-                    if len(plaintext_auto) < 2:
-                        continue
-
-                    first2_auto = plaintext_auto[:2]
-                    second_word4_auto = plaintext_auto[2:6] if len(plaintext_auto) >= 6 else ""
-
-                    passes = True
-                    if have_first2_filter and first2_auto not in two_letter_set:
-                        passes = False
-                    if have_second4_filter and second_word4_auto not in four_letter_set:
-                        passes = False
-
-                    if passes:
-                        scored_auto = score_plaintext(plaintext_auto)
-                        autokey_label = {
-                            "Vig": "Vig autokey",
-                            "Beaufort": "Beaufort autokey",
-                            "Beaufort var": "Beaufort var autokey",
-                        }[mode_name]
-                        candidate_auto = {
-                            "score": scored_auto["score"],
-                            "chi": scored_auto["chi"],
-                            "ioc": scored_auto["ioc"],
-                            "key": key_word,
-                            "mode": autokey_label,
-                            "alphabet_word": alph_info["base_word"],
-                            "alphabet_reversed": alph_info["is_reversed"],
-                            "alphabet_string": alphabet,
-                            "first2": first2_auto,
-                            "plaintext_preview": plaintext_auto[:preview_length],
-                        }
-                        maintain_top_results(results, candidate_auto, max_results)
+                for future in done:
+                    chunk_results, chunk_combos, chunk_autokey_attempts, _ = future.result()
+                    stats["combos_tried"] += chunk_combos
+                    stats["autokey_attempts"] += chunk_autokey_attempts
+                    for candidate in chunk_results:
+                        maintain_top_results(results, candidate, max_results)
 
                 now = time.perf_counter()
-                if now - last_update >= update_interval:
+                if update_interval == 0 or now - last_update >= update_interval:
                     elapsed = now - start_time
                     progress_pct = 100 * stats["combos_tried"] / total_combos if total_combos else 0.0
                     best_score = max((cand["score"] for cand in results), default=0.0)
@@ -478,6 +653,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--end-key-index", type=int, default=None, help="End index within the wordlist (exclusive)")
     parser.add_argument("--preview-length", type=int, default=120, help="Plaintext preview length to display (default: 120)")
     parser.add_argument("--no-autokey", action="store_true", help="Disable autokey family checks")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes to use (default: 1)",
+    )
     return parser.parse_args(argv)
 
 
@@ -521,6 +702,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             end_index=end_index,
             preview_length=max(0, args.preview_length),
             include_autokey=not args.no_autokey,
+            workers=max(1, args.workers),
         )
     except Exception as exc:  # pragma: no cover - runtime validation
         print(f"Search error: {exc}", file=sys.stderr)
