@@ -29,6 +29,12 @@ constexpr std::array<double, 26> kEnglishFreq = {
 
 constexpr double kIocTarget = 0.066;
 
+enum class Mode {
+  kVigenere,
+  kBeaufort,
+  kVariantBeaufort,
+};
+
 struct AlphabetCandidate {
   std::string alphabet;
   std::array<int, 26> index_map{};
@@ -41,18 +47,13 @@ struct Candidate {
   double ioc = 0.0;
   double chi = 0.0;
   std::string key;
-  std::string mode;
+  Mode mode = Mode::kVigenere;
+  bool autokey = false;
   std::string alphabet_word;
   bool alphabet_reversed = false;
   std::string alphabet_string;
   std::string first2;
   std::string plaintext_preview;
-};
-
-enum class Mode {
-  kVigenere,
-  kBeaufort,
-  kVariantBeaufort,
 };
 
 struct Options {
@@ -301,12 +302,14 @@ double chi_square(const std::string &text) {
   return chi;
 }
 
-Candidate make_candidate(const std::string &key_word, const AlphabetCandidate &alphabet,
-                         const std::string &mode_name, const std::string &plaintext,
+Candidate make_candidate(const std::string &key_word,
+                         const AlphabetCandidate &alphabet, Mode mode,
+                         bool autokey_variant, const std::string &plaintext,
                          std::size_t preview_length) {
   Candidate cand;
   cand.key = key_word;
-  cand.mode = mode_name;
+  cand.mode = mode;
+  cand.autokey = autokey_variant;
   cand.alphabet_word = alphabet.base_word;
   cand.alphabet_reversed = alphabet.reversed;
   cand.alphabet_string = alphabet.alphabet;
@@ -409,46 +412,63 @@ Options parse_options(int argc, char *argv[]) {
   return options;
 }
 
-void print_table(const std::vector<Candidate> &candidates) {
-  if (candidates.empty()) {
-    std::cout << "No candidates met the filtering criteria." << std::endl;
-    return;
-  }
-  std::vector<Candidate> sorted = candidates;
-  std::sort(sorted.begin(), sorted.end(),
-            [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
-
-  std::cout << std::setw(3) << "#" << "  " << std::setw(7) << "Score" << "  "
-            << std::setw(8) << "IoC" << "  " << std::setw(8) << "Chi^2" << "  "
-            << std::left << std::setw(20) << "Mode" << "  " << std::setw(15)
-            << "Key" << "  " << std::setw(15) << "Alphabet word" << "  "
-            << std::setw(3) << "Rev" << "  " << std::setw(6) << "First2"
-            << "  Preview" << std::endl;
-  std::cout << std::string(90, '-') << std::endl;
-  int idx = 1;
-  for (const auto &cand : sorted) {
-    std::cout << std::right << std::setw(3) << idx++ << "  " << std::fixed
-              << std::setprecision(3) << std::setw(7) << cand.score << "  "
-              << std::setprecision(4) << std::setw(8) << cand.ioc << "  "
-              << std::setprecision(2) << std::setw(8) << cand.chi << "  "
-              << std::left << std::setw(20) << cand.mode << "  "
-              << std::setw(15) << cand.key << "  " << std::setw(15)
-              << cand.alphabet_word << "  " << std::setw(3)
-              << (cand.alphabet_reversed ? "Y" : "N") << "  " << std::setw(6)
-              << cand.first2 << "  " << cand.plaintext_preview << std::endl;
-  }
-}
-
-std::string mode_display_name(Mode mode, bool autokey) {
+std::string mode_family_name(Mode mode) {
   switch (mode) {
   case Mode::kVigenere:
-    return autokey ? "Vig autokey" : "Vig";
+    return "Vigenere";
   case Mode::kBeaufort:
-    return autokey ? "Beaufort autokey" : "Beaufort";
+    return "Beaufort";
   case Mode::kVariantBeaufort:
-    return autokey ? "Beaufort var autokey" : "Beaufort var";
+    return "Beaufort variant";
   }
   return "";
+}
+
+std::string format_results_table(const std::vector<Candidate> &candidates,
+                                 std::size_t max_rows) {
+  std::ostringstream oss;
+  if (candidates.empty()) {
+    oss << "No candidates met the filtering criteria." << '\n';
+    return oss.str();
+  }
+
+  std::vector<const Candidate *> sorted;
+  sorted.reserve(candidates.size());
+  for (const auto &cand : candidates) {
+    sorted.push_back(&cand);
+  }
+  std::sort(sorted.begin(), sorted.end(), [](const Candidate *a, const Candidate *b) {
+    return a->score > b->score;
+  });
+
+  const std::size_t limit =
+      std::min<std::size_t>({sorted.size(), max_rows, static_cast<std::size_t>(50)});
+
+  oss << std::setw(3) << "#" << "  " << std::setw(7) << "Score" << "  "
+      << std::setw(8) << "IoC" << "  " << std::setw(9) << "Chi^2" << "  "
+      << std::left << std::setw(16) << "Cipher" << "  " << std::setw(8)
+      << "Autokey" << "  " << std::setw(18) << "Key" << "  " << std::setw(15)
+      << "Alphabet word" << "  " << std::setw(3) << "Rev" << "  "
+      << "Plaintext" << '\n';
+  oss << std::string(120, '-') << '\n';
+  for (std::size_t i = 0; i < limit; ++i) {
+    const Candidate &cand = *sorted[i];
+    oss << std::right << std::setw(3) << (i + 1) << "  " << std::fixed
+        << std::setprecision(3) << std::setw(7) << cand.score << "  "
+        << std::setprecision(4) << std::setw(8) << cand.ioc << "  "
+        << std::setprecision(2) << std::setw(9) << cand.chi << "  "
+        << std::left << std::setw(16) << mode_family_name(cand.mode) << "  "
+        << std::setw(8) << (cand.autokey ? "Yes" : "No") << "  "
+        << std::setw(18) << cand.key << "  " << std::setw(15)
+        << cand.alphabet_word << "  " << std::setw(3)
+        << (cand.alphabet_reversed ? "Y" : "N") << "  "
+        << cand.plaintext_preview << '\n';
+  }
+  return oss.str();
+}
+
+void print_table(const std::vector<Candidate> &candidates, std::size_t max_rows) {
+  std::cout << format_results_table(candidates, max_rows);
 }
 
 struct WorkerResult {
@@ -491,9 +511,8 @@ WorkerResult process_keys(const std::vector<std::string> &keys, std::size_t begi
     if (apply_second4 && four_letter_set.find(second4) == four_letter_set.end()) {
       continue;
     }
-        Candidate cand =
-            make_candidate(key_word, alphabet, mode_display_name(mode, false),
-                           plaintext, preview_length);
+        Candidate cand = make_candidate(key_word, alphabet, mode, false,
+                                        plaintext, preview_length);
         maintain_top_results(result.best, cand, max_results);
 
         if (include_autokey) {
@@ -516,9 +535,8 @@ WorkerResult process_keys(const std::vector<std::string> &keys, std::size_t begi
               four_letter_set.find(second4_auto) == four_letter_set.end()) {
             continue;
           }
-          Candidate cand_auto = make_candidate(
-              key_word, alphabet, mode_display_name(mode, true), plaintext_auto,
-              preview_length);
+          Candidate cand_auto = make_candidate(key_word, alphabet, mode, true,
+                                               plaintext_auto, preview_length);
           maintain_top_results(result.best, cand_auto, max_results);
         }
       }
@@ -533,7 +551,8 @@ void progress_loop(const std::atomic<bool> &done, double interval_seconds,
                    std::atomic<std::size_t> &combos_counter,
                    std::atomic<std::size_t> &keys_counter,
                    std::atomic<std::size_t> &autokey_counter,
-                   std::size_t total_combos) {
+                   std::size_t total_combos, std::mutex &results_mutex,
+                   std::vector<Candidate> &results, std::size_t max_rows) {
   using clock = std::chrono::steady_clock;
   const auto start = clock::now();
   while (!done.load(std::memory_order_relaxed)) {
@@ -549,15 +568,22 @@ void progress_loop(const std::atomic<bool> &done, double interval_seconds,
                      ? 0.0
                      : (static_cast<double>(combos) /
                         static_cast<double>(total_combos)) * 100.0;
-    std::cerr << "[" << std::fixed << std::setprecision(1) << elapsed
-              << "s] Keys: " << keys << "  Combos: " << combos;
+    std::vector<Candidate> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(results_mutex);
+      snapshot = results;
+    }
+    std::ostringstream oss;
+    oss << "\033[2J\033[H";
+    oss << std::fixed << std::setprecision(1) << "Elapsed: " << elapsed
+        << "s  Keys: " << keys << "  Combos: " << combos;
     if (total_combos > 0) {
-      std::cerr << " (" << std::setprecision(2) << pct << "%)";
+      oss << " (" << std::setprecision(2) << pct << "%)";
     }
-    if (autokeys > 0) {
-      std::cerr << "  Autokey attempts: " << autokeys;
-    }
-    std::cerr << std::endl;
+    oss << "  Autokey attempts: " << autokeys << '\n';
+    oss << '\n';
+    oss << format_results_table(snapshot, max_rows);
+    std::cout << oss.str() << std::flush;
   }
 }
 
@@ -603,8 +629,11 @@ int main(int argc, char *argv[]) {
     std::atomic<std::size_t> autokey_counter{0};
     std::atomic<std::size_t> keys_counter{0};
 
+    const std::size_t results_limit =
+        std::max<std::size_t>(options.max_results, static_cast<std::size_t>(50));
+
     std::vector<Candidate> global_results;
-    global_results.reserve(options.max_results);
+    global_results.reserve(results_limit);
     std::mutex results_mutex;
 
     std::vector<std::thread> workers;
@@ -617,8 +646,11 @@ int main(int argc, char *argv[]) {
     if (!options.quiet && options.progress_interval_seconds > 0.0) {
       progress_thread = std::thread(progress_loop, std::cref(done),
                                     options.progress_interval_seconds,
-                                    std::ref(combos_counter), std::ref(keys_counter),
-                                    std::ref(autokey_counter), total_combos);
+                                    std::ref(combos_counter),
+                                    std::ref(keys_counter),
+                                    std::ref(autokey_counter), total_combos,
+                                    std::ref(results_mutex),
+                                    std::ref(global_results), results_limit);
     }
 
     auto start_time = std::chrono::steady_clock::now();
@@ -636,11 +668,11 @@ int main(int argc, char *argv[]) {
         WorkerResult worker_result = process_keys(
             words, begin, end, cipher, alphabets, modes, two_letter_set,
             four_letter_set, have_first2_filter, have_second4_filter,
-            options.max_results, options.preview_length, options.include_autokey,
+            results_limit, options.preview_length, options.include_autokey,
             combos_counter, autokey_counter, keys_counter);
         std::lock_guard<std::mutex> lock(results_mutex);
         for (const auto &cand : worker_result.best) {
-          maintain_top_results(global_results, cand, options.max_results);
+          maintain_top_results(global_results, cand, results_limit);
         }
       });
     }
@@ -672,7 +704,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Keys processed: " << keys_counter.load() << '/' << words.size()
               << '\n' << std::endl;
 
-    print_table(global_results);
+    print_table(global_results, results_limit);
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;

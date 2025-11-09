@@ -43,7 +43,9 @@ Key flags:
 
 The tool mirrors the browser worker’s behaviour: it enumerates keyed alphabets in both forward and reversed forms,
 tests the Vigenère, Beaufort, and variant Beaufort families, applies optional structural filters (two-letter start and 4-letter second word),
-and ranks candidates using an IoC/χ² blend. Progress updates stream to stderr while the ranked table prints to stdout when the search finishes.
+and ranks candidates using an IoC/χ² blend. During the search a live dashboard continuously clears and redraws on stdout,
+showing elapsed time, work counters, and the current top 50 plaintext candidates (including cipher family, autokey usage, IoC, χ²,
+and plaintext previews). When the run completes you also receive a final summary followed by the same ranked table for easy capture.
 
 ## Requirements
 
