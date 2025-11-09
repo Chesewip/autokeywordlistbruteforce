@@ -291,6 +291,93 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m {remainder:.1f}s"
 
 
+class LiveRenderer:
+    """Continuously refreshes progress and top candidate details."""
+
+    def __init__(self, max_results: int, stream=None) -> None:
+        self.max_results = max_results
+        self.stream = stream or sys.stderr
+        self._active = False
+        self._supports_clear = hasattr(self.stream, "isatty") and self.stream.isatty()
+        self._bar_width = 40
+
+    def _build_header(self) -> str:
+        return (
+            f"{'#':>3}  {'Score':>7}  {'IoC':>8}  {'Chi^2':>8}  {'Mode':<20}  "
+            f"{'Key':<15}  {'Alphabet word':<15}  {'Rev':<3}  {'First2':<6}  Preview"
+        )
+
+    def render(self, stats: Dict[str, float | int], results: Sequence[Dict[str, object]]) -> None:
+        self._active = True
+        total_combos = int(stats.get("total_combos", 0) or 0)
+        combos_tried = int(stats.get("combos_tried", 0) or 0)
+        keys_processed = int(stats.get("keys_processed", 0) or 0)
+        keys_considered = int(stats.get("keys_considered", 0) or 0)
+        autokey_attempts = int(stats.get("autokey_attempts", 0) or 0)
+        worker_count = int(stats.get("worker_count", 1) or 1)
+        elapsed_seconds = float(stats.get("elapsed_seconds", 0.0) or 0.0)
+
+        progress_ratio = 0.0
+        if total_combos > 0:
+            progress_ratio = min(1.0, combos_tried / total_combos)
+        filled = int(round(progress_ratio * self._bar_width))
+        progress_bar = "[" + "#" * filled + "-" * (self._bar_width - filled) + "]"
+        best_score = max((cand["score"] for cand in results), default=0.0)
+
+        lines = []
+        lines.append(
+            "Workers: {workers}  Keys: {processed}/{total_keys}  Combos: {combos}/{total_combos}  "
+            "Autokey attempts: {autokey}".format(
+                workers=worker_count,
+                processed=keys_processed,
+                total_keys=keys_considered,
+                combos=combos_tried,
+                total_combos=total_combos,
+                autokey=autokey_attempts,
+            )
+        )
+        lines.append(
+            f"{progress_bar}  {progress_ratio * 100:5.1f}%  elapsed {format_duration(elapsed_seconds)}"
+        )
+        lines.append(f"Best score: {best_score:0.3f}")
+        lines.append("")
+
+        display_limit = min(50, self.max_results)
+        header = self._build_header()
+        lines.append(f"Top candidates (showing up to {display_limit}):")
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        sorted_results = sorted(results, key=lambda c: c["score"], reverse=True)
+        for idx, candidate in enumerate(sorted_results[:display_limit], start=1):
+            rev_flag = "Y" if candidate["alphabet_reversed"] else "N"
+            lines.append(
+                f"{idx:>3}  "
+                f"{candidate['score']:7.3f}  "
+                f"{candidate['ioc']:8.4f}  "
+                f"{candidate['chi']:8.2f}  "
+                f"{str(candidate['mode']):<20}  "
+                f"{str(candidate['key']):<15}  "
+                f"{str(candidate['alphabet_word']):<15}  "
+                f"{rev_flag:<3}  "
+                f"{candidate['first2']:<6}  "
+                f"{candidate['plaintext_preview']}"
+            )
+
+        output = "\n".join(lines)
+        if self._supports_clear:
+            self.stream.write("\033[2J\033[H")
+        self.stream.write(output + "\n")
+        self.stream.flush()
+
+    def finish(self, stats: Dict[str, float | int], results: Sequence[Dict[str, object]]) -> None:
+        self.render(stats, results)
+        if self._supports_clear:
+            self.stream.write("\n")
+            self.stream.flush()
+        self._active = False
+
+
 def evaluate_key_word(
     key_word: str,
     cipher: str,
@@ -492,10 +579,12 @@ def run_search(
         "combos_tried": 0,
         "autokey_attempts": 0,
         "worker_count": worker_count,
+        "keys_processed": 0,
     }
 
     last_update = time.perf_counter()
     start_time = last_update
+    renderer = LiveRenderer(max_results=max_results)
 
     if worker_count == 1:
         for key_word in key_subset:
@@ -514,20 +603,15 @@ def run_search(
             )
             stats["combos_tried"] += combos
             stats["autokey_attempts"] += autokey_attempts
+            stats["keys_processed"] += 1
             for candidate in key_results:
                 maintain_top_results(results, candidate, max_results)
 
             now = time.perf_counter()
             if update_interval == 0 or now - last_update >= update_interval:
                 elapsed = now - start_time
-                progress_pct = 100 * stats["combos_tried"] / total_combos if total_combos else 0.0
-                best_score = max((cand["score"] for cand in results), default=0.0)
-                print(
-                    f"Progress: {stats['combos_tried']}/{total_combos} combos "
-                    f"({progress_pct:.3f}%), elapsed {format_duration(elapsed)}, "
-                    f"best score {best_score:.3f}",
-                    file=sys.stderr,
-                )
+                stats["elapsed_seconds"] = elapsed
+                renderer.render(stats, results)
                 last_update = now
     else:
         chunk_size = max(1, math.ceil(len(key_subset) / (worker_count * 4)))
@@ -568,42 +652,28 @@ def run_search(
                     now = time.perf_counter()
                     if update_interval > 0 and now - last_update >= update_interval:
                         elapsed = now - start_time
-                        progress_pct = (
-                            100 * stats["combos_tried"] / total_combos
-                            if total_combos
-                            else 0.0
-                        )
-                        best_score = max((cand["score"] for cand in results), default=0.0)
-                        print(
-                            f"Progress: {stats['combos_tried']}/{total_combos} combos "
-                            f"({progress_pct:.3f}%), elapsed {format_duration(elapsed)}, "
-                            f"best score {best_score:.3f}",
-                            file=sys.stderr,
-                        )
+                        stats["elapsed_seconds"] = elapsed
+                        renderer.render(stats, results)
                         last_update = now
                     continue
 
                 for future in done:
-                    chunk_results, chunk_combos, chunk_autokey_attempts, _ = future.result()
+                    chunk_results, chunk_combos, chunk_autokey_attempts, chunk_keys = future.result()
                     stats["combos_tried"] += chunk_combos
                     stats["autokey_attempts"] += chunk_autokey_attempts
+                    stats["keys_processed"] += chunk_keys
                     for candidate in chunk_results:
                         maintain_top_results(results, candidate, max_results)
 
                 now = time.perf_counter()
                 if update_interval == 0 or now - last_update >= update_interval:
                     elapsed = now - start_time
-                    progress_pct = 100 * stats["combos_tried"] / total_combos if total_combos else 0.0
-                    best_score = max((cand["score"] for cand in results), default=0.0)
-                    print(
-                        f"Progress: {stats['combos_tried']}/{total_combos} combos "
-                        f"({progress_pct:.3f}%), elapsed {format_duration(elapsed)}, "
-                        f"best score {best_score:.3f}",
-                        file=sys.stderr,
-                    )
+                    stats["elapsed_seconds"] = elapsed
+                    renderer.render(stats, results)
                     last_update = now
 
     stats["elapsed_seconds"] = time.perf_counter() - start_time
+    renderer.finish(stats, results)
     return results, stats
 
 

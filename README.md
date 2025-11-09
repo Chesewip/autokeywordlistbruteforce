@@ -61,9 +61,9 @@ optional arguments:
 
 ### Progress and Output
 
-* Progress is printed to stderr at the configured interval.
-* Final runtime statistics are printed once the search completes.
-* Candidate summaries are printed to stdout, sorted by score.
+* While the search runs the solver continuously refreshes a progress dashboard on stderr. It includes a progress bar, live statistics, and the current top 50 candidates (or fewer if `--max-results` is lower).
+* Adjust `--update-interval` to control how frequently the dashboard refreshes. Setting it to `0` forces an update after every chunk of work.
+* Once the search completes, a final summary is printed to stderr and the same ranked candidate table is emitted to stdout so you can pipe it to other tools.
   Columns include the cipher mode, key word, alphabet word (and whether it was reversed), the first two plaintext letters, and a preview of the plaintext.
 
 ## Worked Examples
