@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cctype>
 #include <fstream>
@@ -20,6 +21,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -45,6 +50,12 @@ struct AlphabetCandidate {
   bool alphabet_reversed = false;
   bool keyword_front = true;
 };
+
+#if defined(__AVX2__)
+struct alignas(32) KeyBlock {
+  std::array<std::uint8_t, 32> data{};
+};
+#endif
 
 struct Candidate {
   double score = 0.0;
@@ -315,11 +326,6 @@ build_alphabet_candidates(const std::vector<std::string> &words,
           make_alphabet_candidate(word, false, true, false);
       unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
     }
-    if (true) { //Reversed alphabet and reverse key forgot to add, just always true for now
-        AlphabetCandidate rev_alphabet_back =
-            make_alphabet_candidate(word, true, true, false);
-        unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
-    }
   }
   std::vector<AlphabetCandidate> result;
   result.reserve(unique_map.size());
@@ -336,37 +342,169 @@ inline int alphabet_index(const AlphabetCandidate &alphabet, char ch) {
   return alphabet.index_map[ch - 'A'];
 }
 
+inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
+                                   std::uint8_t key_idx, Mode mode) {
+  int value = 0;
+  switch (mode) {
+  case Mode::kVigenere:
+    value = static_cast<int>(cipher_idx) - static_cast<int>(key_idx);
+    if (value < 0) {
+      value += 26;
+    }
+    break;
+  case Mode::kBeaufort:
+    value = static_cast<int>(key_idx) - static_cast<int>(cipher_idx);
+    if (value < 0) {
+      value += 26;
+    }
+    break;
+  case Mode::kVariantBeaufort:
+    value = static_cast<int>(cipher_idx) + static_cast<int>(key_idx);
+    if (value >= 26) {
+      value -= 26;
+    }
+    break;
+  }
+  return static_cast<std::uint8_t>(value);
+}
+
 std::string decrypt_repeating(const std::string &cipher, const std::string &key,
                               const AlphabetCandidate &alphabet, Mode mode) {
   if (cipher.empty() || key.empty()) {
     return {};
   }
-  std::string result;
-  result.reserve(cipher.size());
-  const std::string &alph = alphabet.alphabet;
+
+  const std::size_t text_len = cipher.size();
   const std::size_t key_len = key.size();
-  for (std::size_t i = 0; i < cipher.size(); ++i) {
+  const std::string &alph = alphabet.alphabet;
+
+  std::string result = cipher;
+  std::vector<std::uint8_t> cipher_indices(text_len, 0);
+  std::vector<std::uint8_t> letter_mask(text_len, 0);
+
+  for (std::size_t i = 0; i < text_len; ++i) {
     char c = cipher[i];
-    int c_idx = alphabet_index(alphabet, c);
-    int k_idx = alphabet_index(alphabet, key[i % key_len]);
-    if (c_idx < 0 || k_idx < 0) {
-      result.push_back(c);
-      continue;
+    if (c >= 'A' && c <= 'Z') {
+      int idx = alphabet_index(alphabet, c);
+      if (idx >= 0) {
+        cipher_indices[i] = static_cast<std::uint8_t>(idx);
+        letter_mask[i] = 1;
+      }
     }
-    int p_idx = 0;
+  }
+
+  std::vector<std::uint8_t> key_indices(key_len, 0);
+  std::vector<std::uint8_t> key_valid(key_len, 1);
+  for (std::size_t i = 0; i < key_len; ++i) {
+    int idx = alphabet_index(alphabet, key[i]);
+    if (idx < 0) {
+      key_valid[i] = 0;
+      key_indices[i] = 0;
+    } else {
+      key_indices[i] = static_cast<std::uint8_t>(idx);
+    }
+  }
+
+  std::vector<std::uint8_t> plaintext_indices(text_len, 0);
+
+#if defined(__AVX2__)
+  if (text_len >= 32) {
+    std::vector<KeyBlock> key_blocks(key_len);
+    for (std::size_t start = 0; start < key_len; ++start) {
+      auto &block = key_blocks[start];
+      for (std::size_t j = 0; j < block.data.size(); ++j) {
+        block.data[j] = key_indices[(start + j) % key_len];
+      }
+    }
+
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i twenty_six = _mm256_set1_epi8(26);
+    const __m256i twenty_five = _mm256_set1_epi8(25);
+
+    std::size_t vec_index = 0;
+    std::size_t block_offset = 0;
+
     switch (mode) {
     case Mode::kVigenere:
-      p_idx = (c_idx - k_idx + 26) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_sub_epi8(cipher_vec, key_vec);
+        __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+        plain_vec = _mm256_add_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     case Mode::kBeaufort:
-      p_idx = (k_idx - c_idx + 26) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_sub_epi8(key_vec, cipher_vec);
+        __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+        plain_vec = _mm256_add_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     case Mode::kVariantBeaufort:
-      p_idx = (c_idx + k_idx) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_add_epi8(cipher_vec, key_vec);
+        __m256i mask = _mm256_cmpgt_epi8(plain_vec, twenty_five);
+        plain_vec = _mm256_sub_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     }
-    result.push_back(alph[p_idx]);
+
+    for (std::size_t i = vec_index; i < text_len; ++i) {
+      if (!letter_mask[i] || !key_valid[i % key_len]) {
+        continue;
+      }
+      plaintext_indices[i] =
+          decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    }
+  } else {
+#endif
+    for (std::size_t i = 0; i < text_len; ++i) {
+      if (!letter_mask[i] || !key_valid[i % key_len]) {
+        continue;
+      }
+      plaintext_indices[i] =
+          decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    }
+#if defined(__AVX2__)
   }
+#endif
+
+  for (std::size_t i = 0; i < text_len; ++i) {
+    if (!letter_mask[i] || !key_valid[i % key_len]) {
+      continue;
+    }
+    std::uint8_t idx = plaintext_indices[i];
+    if (idx < alph.size()) {
+      result[i] = alph[idx];
+    }
+  }
+
   return result;
 }
 
@@ -479,7 +617,7 @@ Candidate make_candidate(
   const double word_weight = 0.8;
   const double stats_weight = 1.0 - word_weight;
   cand.score = stats_score;
-  if (cand.ioc > .05 && cand.chi < 150 && spacing_pattern && spacing_words_by_length) {
+  if (spacing_pattern && spacing_words_by_length) {
     auto result = count_spacing_matches(plaintext, *spacing_pattern,
                                         *spacing_words_by_length);
     cand.spacing_matches = result.first;
