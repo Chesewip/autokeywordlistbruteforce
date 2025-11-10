@@ -315,6 +315,11 @@ build_alphabet_candidates(const std::vector<std::string> &words,
           make_alphabet_candidate(word, false, true, false);
       unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
     }
+    if (true) { //Reversed alphabet and reverse key forgot to add, just always true for now
+        AlphabetCandidate rev_alphabet_back =
+            make_alphabet_candidate(word, true, true, false);
+        unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
+    }
   }
   std::vector<AlphabetCandidate> result;
   result.reserve(unique_map.size());
@@ -474,7 +479,7 @@ Candidate make_candidate(
   const double word_weight = 0.8;
   const double stats_weight = 1.0 - word_weight;
   cand.score = stats_score;
-  if (spacing_pattern && spacing_words_by_length) {
+  if (cand.ioc > .05 && cand.chi < 150 && spacing_pattern && spacing_words_by_length) {
     auto result = count_spacing_matches(plaintext, *spacing_pattern,
                                         *spacing_words_by_length);
     cand.spacing_matches = result.first;
@@ -1043,6 +1048,12 @@ int main(int argc, char *argv[]) {
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;
+
+#if defined(_WIN32)
+    std::cout << "Press Enter to exit..." << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+#endif
+
     return 1;
   }
 }
