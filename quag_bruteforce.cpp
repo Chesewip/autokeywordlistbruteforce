@@ -59,6 +59,7 @@ struct Candidate {
 struct Options {
   std::string ciphertext;
   std::string wordlist;
+  std::string alphabet_wordlist;
   std::string two_letter_list;
   std::size_t max_results = 50;
   std::size_t preview_length = 80;
@@ -388,6 +389,10 @@ Options parse_options(int argc, char *argv[]) {
       options.wordlist = read_file(require_value(arg));
     } else if (arg == "--wordlist-inline") {
       options.wordlist = require_value(arg);
+    } else if (arg == "--alphabet-wordlist") {
+      options.alphabet_wordlist = read_file(require_value(arg));
+    } else if (arg == "--alphabet-wordlist-inline") {
+      options.alphabet_wordlist = require_value(arg);
     } else if (arg == "--two-letter-list") {
       options.two_letter_list = read_file(require_value(arg));
     } else if (arg == "--two-letter-inline") {
@@ -411,6 +416,8 @@ Options parse_options(int argc, char *argv[]) {
                 << "  --ciphertext-file <path>        File containing ciphertext\n"
                 << "  --wordlist <path>               Main wordlist file (required)\n"
                 << "  --wordlist-inline <text>        Inline wordlist string\n"
+                << "  --alphabet-wordlist <path>      Alphabet wordlist file (defaults to main)\n"
+                << "  --alphabet-wordlist-inline <text> Inline alphabet wordlist string\n"
                 << "  --two-letter-list <path>        Optional 2-letter filter list\n"
                 << "  --two-letter-inline <text>      Inline 2-letter filter string\n"
                 << "  --max-results <N>               Max candidates to keep (default 50)\n"
@@ -431,6 +438,9 @@ Options parse_options(int argc, char *argv[]) {
   }
   if (options.wordlist.empty()) {
     throw std::runtime_error("Wordlist is required (use --wordlist or --wordlist-inline)");
+  }
+  if (options.alphabet_wordlist.empty()) {
+    options.alphabet_wordlist = options.wordlist;
   }
   if (options.threads == 0) {
     options.threads = 1;
@@ -495,6 +505,16 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
 
 void print_table(const std::vector<Candidate> &candidates, std::size_t max_rows) {
   std::cout << format_results_table(candidates, max_rows);
+}
+
+void write_results_to_file(const std::vector<Candidate> &candidates,
+                           std::size_t max_rows,
+                           const std::string &path) {
+  std::ofstream output(path);
+  if (!output) {
+    throw std::runtime_error("Failed to open results output file: " + path);
+  }
+  output << format_results_table(candidates, max_rows);
 }
 
 struct WorkerResult {
@@ -647,18 +667,25 @@ int main(int argc, char *argv[]) {
     Options options = parse_options(argc, argv);
 
     const std::string cipher = clean_letters(options.ciphertext);
-    const std::vector<std::string> words = parse_wordlist(options.wordlist);
-    if (words.empty()) {
+    const std::vector<std::string> key_words = parse_wordlist(options.wordlist);
+    if (key_words.empty()) {
       throw std::runtime_error("Wordlist is empty after cleaning");
+    }
+    const std::vector<std::string> alphabet_words =
+        parse_wordlist(options.alphabet_wordlist);
+    if (alphabet_words.empty()) {
+      throw std::runtime_error(
+          "Alphabet wordlist is empty after cleaning");
     }
     const std::unordered_set<std::string> two_letter_set =
         parse_two_letter_list(options.two_letter_list);
     const std::unordered_set<std::string> four_letter_set =
-        build_four_letter_set(words);
+        build_four_letter_set(key_words);
     const bool have_first2_filter = !two_letter_set.empty();
     const bool have_second4_filter = !four_letter_set.empty();
 
-    std::vector<AlphabetCandidate> alphabets = build_alphabet_candidates(words);
+    std::vector<AlphabetCandidate> alphabets =
+        build_alphabet_candidates(alphabet_words);
     if (alphabets.empty()) {
       throw std::runtime_error("No alphabet candidates generated from wordlist");
     }
@@ -666,10 +693,11 @@ int main(int argc, char *argv[]) {
     std::vector<Mode> modes = {Mode::kVigenere, Mode::kBeaufort,
                                Mode::kVariantBeaufort};
 
-    const std::size_t total_combos = words.size() * alphabets.size() * modes.size();
+    const std::size_t total_combos =
+        key_words.size() * alphabets.size() * modes.size();
 
     std::cout << "Cipher length: " << cipher.size() << '\n';
-    std::cout << "Key candidates: " << words.size() << '\n';
+    std::cout << "Key candidates: " << key_words.size() << '\n';
     std::cout << "Alphabet candidates: " << alphabets.size() << '\n';
     std::cout << "Modes per key: " << modes.size() << '\n';
     std::cout << "Total combinations: " << total_combos << '\n';
@@ -691,8 +719,8 @@ int main(int argc, char *argv[]) {
 
     std::vector<std::thread> workers;
     const std::size_t thread_count = std::max<std::size_t>(1, options.threads);
-    const std::size_t base_chunk = words.size() / thread_count;
-    const std::size_t remainder = words.size() % thread_count;
+    const std::size_t base_chunk = key_words.size() / thread_count;
+    const std::size_t remainder = key_words.size() % thread_count;
 
     std::atomic<bool> done{false};
     std::thread progress_thread;
@@ -719,7 +747,7 @@ int main(int argc, char *argv[]) {
       }
       workers.emplace_back([&, begin, end]() {
         WorkerResult worker_result = process_keys(
-            words, begin, end, cipher, alphabets, modes, two_letter_set,
+            key_words, begin, end, cipher, alphabets, modes, two_letter_set,
             four_letter_set, have_first2_filter, have_second4_filter,
             results_limit, options.preview_length, options.include_autokey,
             combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
@@ -754,10 +782,21 @@ int main(int argc, char *argv[]) {
     if (options.include_autokey) {
       std::cout << "Autokey attempts: " << autokey_counter.load() << '\n';
     }
-    std::cout << "Keys processed: " << keys_counter.load() << '/' << words.size()
+    std::cout << "Keys processed: " << keys_counter.load() << '/' << key_words.size()
               << '\n' << std::endl;
 
     print_table(global_results, results_limit);
+    const std::string results_path = "bruteforce_results.txt";
+    try {
+      write_results_to_file(global_results, results_limit, results_path);
+      std::cout << "Results written to " << results_path << '\n';
+    } catch (const std::exception &file_ex) {
+      std::cerr << "Failed to write results file: " << file_ex.what() << '\n';
+    }
+#if defined(_WIN32)
+    std::cout << "Press Enter to exit..." << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+#endif
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;
