@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <cmath>
 #include <iomanip>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -58,6 +60,8 @@ struct Candidate {
   std::string alphabet_string;
   std::string first2;
   std::string plaintext_preview;
+  int spacing_matches = -1;
+  int spacing_total = 0;
 };
 
 struct Options {
@@ -65,6 +69,8 @@ struct Options {
   std::string wordlist;
   std::string alphabet_wordlist;
   std::string two_letter_list;
+  std::string spacing_wordlist;
+  std::string spacing_guide;
   std::size_t max_results = 50;
   std::size_t preview_length = 80;
   std::size_t threads = std::max<std::size_t>(1, std::thread::hardware_concurrency());
@@ -135,6 +141,74 @@ std::unordered_set<std::string> build_four_letter_set(const std::vector<std::str
     }
   }
   return result;
+}
+
+std::unordered_map<int, std::unordered_set<std::string>>
+build_words_by_length(const std::vector<std::string> &words) {
+  std::unordered_map<int, std::unordered_set<std::string>> grouped;
+  for (const auto &word : words) {
+    grouped[static_cast<int>(word.size())].insert(word);
+  }
+  return grouped;
+}
+
+std::vector<int> parse_spacing_pattern(const std::string &pattern_text) {
+  std::vector<int> pattern;
+  int current = 0;
+  bool in_number = false;
+  for (char ch : pattern_text) {
+    if (std::isdigit(static_cast<unsigned char>(ch))) {
+      current = current * 10 + (ch - '0');
+      in_number = true;
+    } else {
+      if (in_number) {
+        if (current <= 0) {
+          throw std::runtime_error("Spacing guide values must be positive integers");
+        }
+        pattern.push_back(current);
+        current = 0;
+        in_number = false;
+      }
+    }
+  }
+  if (in_number) {
+    if (current <= 0) {
+      throw std::runtime_error("Spacing guide values must be positive integers");
+    }
+    pattern.push_back(current);
+  }
+  return pattern;
+}
+
+std::pair<int, int> count_spacing_matches(
+    const std::string &plaintext, const std::vector<int> &pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>> &words_by_length) {
+  if (pattern.empty() || words_by_length.empty()) {
+    return {-1, 0};
+  }
+  int matches = 0;
+  int considered = 0;
+  std::size_t offset = 0;
+  for (int length : pattern) {
+    if (length <= 0) {
+      continue;
+    }
+    if (offset + static_cast<std::size_t>(length) > plaintext.size()) {
+      break;
+    }
+    auto it = words_by_length.find(length);
+    if (it == words_by_length.end() || it->second.empty()) {
+      offset += static_cast<std::size_t>(length);
+      continue;
+    }
+    const std::string word = plaintext.substr(offset, static_cast<std::size_t>(length));
+    ++considered;
+    if (it->second.find(word) != it->second.end()) {
+      ++matches;
+    }
+    offset += static_cast<std::size_t>(length);
+  }
+  return {matches, considered};
 }
 
 std::string build_keyed_alphabet(const std::string &word, bool keyword_reversed,
@@ -372,10 +446,12 @@ double chi_square(const std::string &text) {
   return chi;
 }
 
-Candidate make_candidate(const std::string &key_word,
-                         const AlphabetCandidate &alphabet, Mode mode,
-                         bool autokey_variant, const std::string &plaintext,
-                         std::size_t preview_length) {
+Candidate make_candidate(
+    const std::string &key_word, const AlphabetCandidate &alphabet, Mode mode,
+    bool autokey_variant, const std::string &plaintext,
+    std::size_t preview_length, const std::vector<int> *spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_by_length) {
   Candidate cand;
   cand.key = key_word;
   cand.mode = mode;
@@ -394,7 +470,21 @@ Candidate make_candidate(const std::string &key_word,
   const double chi_clamped = std::min(400.0, cand.chi);
   const double chi_score = std::max(0.0, 1.0 - chi_clamped / 400.0);
   const double quality_factor = 0.1 + 0.9 * chi_score;
-  cand.score = ioc_score * quality_factor;
+  const double stats_score = ioc_score * quality_factor;
+  const double word_weight = 0.8;
+  const double stats_weight = 1.0 - word_weight;
+  cand.score = stats_score;
+  if (spacing_pattern && spacing_words_by_length) {
+    auto result = count_spacing_matches(plaintext, *spacing_pattern,
+                                        *spacing_words_by_length);
+    cand.spacing_matches = result.first;
+    cand.spacing_total = result.second;
+    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) {
+      double word_score = static_cast<double>(cand.spacing_matches) /
+                          static_cast<double>(cand.spacing_total);
+      cand.score = word_weight * word_score + stats_weight * stats_score;
+    }
+  }
   return cand;
 }
 
@@ -460,6 +550,14 @@ Options parse_options(int argc, char *argv[]) {
       options.two_letter_list = read_file(require_value(arg));
     } else if (arg == "--two-letter-inline") {
       options.two_letter_list = require_value(arg);
+    } else if (arg == "--spacing-wordlist") {
+      options.spacing_wordlist = read_file(require_value(arg));
+    } else if (arg == "--spacing-wordlist-inline") {
+      options.spacing_wordlist = require_value(arg);
+    } else if (arg == "--spacing-guide") {
+      options.spacing_guide = require_value(arg);
+    } else if (arg == "--spacing-guide-file") {
+      options.spacing_guide = read_file(require_value(arg));
     } else if (arg == "--max-results") {
       options.max_results = static_cast<std::size_t>(std::stoul(require_value(arg)));
     } else if (arg == "--preview-length") {
@@ -493,6 +591,10 @@ Options parse_options(int argc, char *argv[]) {
                 << "  --alphabet-wordlist-inline <text> Inline alphabet wordlist string\n"
                 << "  --two-letter-list <path>        Optional 2-letter filter list\n"
                 << "  --two-letter-inline <text>      Inline 2-letter filter string\n"
+                << "  --spacing-wordlist <path>       Wordlist used for spacing guide scoring\n"
+                << "  --spacing-wordlist-inline <text> Inline spacing wordlist string\n"
+                << "  --spacing-guide <pattern>       Word length pattern (e.g. 2-4-3-3)\n"
+                << "  --spacing-guide-file <path>     File containing word length pattern\n"
                 << "  --max-results <N>               Max candidates to keep (default 50)\n"
                 << "  --preview-length <N>            Plaintext preview length (default 80)\n"
                 << "  --threads <N>                   Worker threads (default hardware)\n"
@@ -519,6 +621,10 @@ Options parse_options(int argc, char *argv[]) {
   }
   if (options.alphabet_wordlist.empty()) {
     options.alphabet_wordlist = options.wordlist;
+  }
+  if (!options.spacing_guide.empty() && options.spacing_wordlist.empty()) {
+    throw std::runtime_error(
+        "Spacing guide provided but spacing wordlist is missing (use --spacing-wordlist)");
   }
   if (options.threads == 0) {
     options.threads = 1;
@@ -566,7 +672,8 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
       std::min<std::size_t>({sorted.size(), max_rows, static_cast<std::size_t>(50)});
 
   oss << std::setw(3) << "#" << "  " << std::setw(7) << "Score" << "  "
-      << std::setw(8) << "IoC" << "  " << std::setw(9) << "Chi^2" << "  "
+      << std::setw(7) << "Words" << "  " << std::setw(8) << "IoC" << "  "
+      << std::setw(9) << "Chi^2" << "  "
       << std::left << std::setw(16) << "Cipher" << "  " << std::setw(8)
       << "Autokey" << "  " << std::setw(18) << "Key" << "  " << std::setw(15)
       << "Alphabet word" << "  " << std::setw(6) << "KeyRev" << "  "
@@ -575,8 +682,18 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
   oss << std::string(140, '-') << '\n';
   for (std::size_t i = 0; i < limit; ++i) {
     const Candidate &cand = *sorted[i];
+    std::string word_summary;
+    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) {
+      word_summary = std::to_string(cand.spacing_matches) + "/" +
+                     std::to_string(cand.spacing_total);
+    } else if (cand.spacing_matches == 0 && cand.spacing_total == 0) {
+      word_summary = "0/0";
+    } else {
+      word_summary = "--";
+    }
     oss << std::right << std::setw(3) << (i + 1) << "  " << std::fixed
         << std::setprecision(3) << std::setw(7) << cand.score << "  "
+        << std::setw(7) << word_summary << "  "
         << std::setprecision(4) << std::setw(8) << cand.ioc << "  "
         << std::setprecision(2) << std::setw(9) << cand.chi << "  "
         << std::left << std::setw(16) << mode_family_name(cand.mode) << "  "
@@ -620,6 +737,9 @@ WorkerResult process_keys(
     const std::unordered_set<std::string>& two_letter_set,
     const std::unordered_set<std::string>& four_letter_set,
     bool have_first2_filter, bool have_second4_filter,
+    const std::vector<int> *spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_by_length,
     std::size_t max_results, std::size_t preview_length,
     bool include_autokey, std::atomic<std::size_t>& combos_counter,
     std::atomic<std::size_t>& autokey_counter,
@@ -657,7 +777,9 @@ WorkerResult process_keys(
           continue;
         }
         Candidate cand = make_candidate(key_word, alphabet, mode, false,
-                                        plaintext, preview_length);
+                                        plaintext, preview_length,
+                                        spacing_pattern,
+                                        spacing_words_by_length);
         maintain_top_results(result.best, cand, max_results);
 
 
@@ -682,8 +804,9 @@ WorkerResult process_keys(
               four_letter_set.find(second4_auto) == four_letter_set.end()) {
             continue;
           }
-          Candidate cand_auto = make_candidate(key_word, alphabet, mode, true,
-                                               plaintext_auto, preview_length);
+          Candidate cand_auto = make_candidate(
+              key_word, alphabet, mode, true, plaintext_auto, preview_length,
+              spacing_pattern, spacing_words_by_length);
           maintain_top_results(result.best, cand_auto, max_results);
         }
       }
@@ -765,10 +888,36 @@ int main(int argc, char *argv[]) {
       throw std::runtime_error(
           "Alphabet wordlist is empty after cleaning");
     }
+    std::vector<std::string> spacing_words;
+    if (!options.spacing_wordlist.empty()) {
+      spacing_words = parse_wordlist(options.spacing_wordlist);
+      if (spacing_words.empty()) {
+        throw std::runtime_error(
+            "Spacing wordlist is empty after cleaning");
+      }
+    }
+    std::vector<int> spacing_pattern;
+    std::unordered_map<int, std::unordered_set<std::string>>
+        spacing_words_by_length;
+    if (!options.spacing_guide.empty()) {
+      spacing_pattern = parse_spacing_pattern(options.spacing_guide);
+      if (spacing_pattern.empty()) {
+        throw std::runtime_error(
+            "Spacing guide did not contain any valid word lengths");
+      }
+      if (spacing_words.empty()) {
+        throw std::runtime_error(
+            "Spacing guide requires a spacing wordlist");
+      }
+      spacing_words_by_length = build_words_by_length(spacing_words);
+    }
+    const bool spacing_scoring_enabled =
+        !spacing_pattern.empty() && !spacing_words_by_length.empty();
     const std::unordered_set<std::string> two_letter_set =
         parse_two_letter_list(options.two_letter_list);
-    const std::unordered_set<std::string> four_letter_set =
-        build_four_letter_set(key_words);
+    const std::unordered_set<std::string> four_letter_set = !spacing_words.empty()
+                                                                ? build_four_letter_set(spacing_words)
+                                                                : build_four_letter_set(key_words);
     const bool have_first2_filter = !two_letter_set.empty();
     const bool have_second4_filter = !four_letter_set.empty();
 
@@ -800,6 +949,11 @@ int main(int argc, char *argv[]) {
 
     const std::size_t results_limit =
         std::max<std::size_t>(options.max_results, static_cast<std::size_t>(50));
+    const std::vector<int> *spacing_pattern_ptr =
+        spacing_scoring_enabled ? &spacing_pattern : nullptr;
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_ptr =
+            spacing_scoring_enabled ? &spacing_words_by_length : nullptr;
 
     std::vector<Candidate> global_results;
     global_results.reserve(results_limit);
@@ -837,6 +991,7 @@ int main(int argc, char *argv[]) {
         WorkerResult worker_result = process_keys(
             key_words, begin, end, cipher, alphabets, modes, two_letter_set,
             four_letter_set, have_first2_filter, have_second4_filter,
+            spacing_pattern_ptr, spacing_words_ptr,
             results_limit, options.preview_length, options.include_autokey,
             combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
         std::lock_guard<std::mutex> lock(results_mutex);
