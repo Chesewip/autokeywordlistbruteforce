@@ -1186,6 +1186,12 @@ int main(int argc, char *argv[]) {
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;
+
+#if defined(_WIN32)
+    std::cout << "Press Enter to exit..." << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+#endif
+
     return 1;
   }
 }
