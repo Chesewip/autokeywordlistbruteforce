@@ -261,6 +261,16 @@ std::string build_keyed_alphabet(const std::string &word, bool keyword_reversed,
         alphabet.push_back(static_cast<char>('A' + i));
       }
     }
+  } else {
+    for (int i = 0; i < 26; ++i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
+    }
+  }
+
+  if (!keyword_front) {
+    alphabet.append(unique_key);
   }
 
   if (!keyword_front) {
@@ -368,8 +378,18 @@ inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
   return static_cast<std::uint8_t>(value);
 }
 
-std::string decrypt_repeating(const std::string &cipher, const std::string &key,
-                              const AlphabetCandidate &alphabet, Mode mode) {
+std::string decrypt_repeating(
+    const std::string &cipher, const std::string &key,
+    const AlphabetCandidate &alphabet, Mode mode,
+    const std::vector<std::uint8_t> &cipher_indices,
+    const std::vector<std::uint8_t> &letter_mask,
+    std::vector<std::uint8_t> &key_indices,
+    std::vector<std::uint8_t> &key_valid,
+    std::vector<std::uint8_t> &plaintext_indices
+#if defined(__AVX2__)
+    , std::vector<KeyBlock> &key_blocks
+#endif
+    ) {
   if (cipher.empty() || key.empty()) {
     return {};
   }
@@ -379,22 +399,8 @@ std::string decrypt_repeating(const std::string &cipher, const std::string &key,
   const std::string &alph = alphabet.alphabet;
 
   std::string result = cipher;
-  std::vector<std::uint8_t> cipher_indices(text_len, 0);
-  std::vector<std::uint8_t> letter_mask(text_len, 0);
-
-  for (std::size_t i = 0; i < text_len; ++i) {
-    char c = cipher[i];
-    if (c >= 'A' && c <= 'Z') {
-      int idx = alphabet_index(alphabet, c);
-      if (idx >= 0) {
-        cipher_indices[i] = static_cast<std::uint8_t>(idx);
-        letter_mask[i] = 1;
-      }
-    }
-  }
-
-  std::vector<std::uint8_t> key_indices(key_len, 0);
-  std::vector<std::uint8_t> key_valid(key_len, 1);
+  key_indices.resize(key_len);
+  key_valid.resize(key_len);
   for (std::size_t i = 0; i < key_len; ++i) {
     int idx = alphabet_index(alphabet, key[i]);
     if (idx < 0) {
@@ -402,14 +408,15 @@ std::string decrypt_repeating(const std::string &cipher, const std::string &key,
       key_indices[i] = 0;
     } else {
       key_indices[i] = static_cast<std::uint8_t>(idx);
+      key_valid[i] = 1;
     }
   }
 
-  std::vector<std::uint8_t> plaintext_indices(text_len, 0);
+  plaintext_indices.resize(text_len);
 
 #if defined(__AVX2__)
   if (text_len >= 32) {
-    std::vector<KeyBlock> key_blocks(key_len);
+    key_blocks.resize(key_len);
     for (std::size_t start = 0; start < key_len; ++start) {
       auto &block = key_blocks[start];
       for (std::size_t j = 0; j < block.data.size(); ++j) {
@@ -892,18 +899,60 @@ WorkerResult process_keys(
 {
   WorkerResult result;
   result.best.reserve(max_results);
-  for (std::size_t idx = begin; idx < end; ++idx) 
+
+  const std::size_t text_len = cipher.size();
+  struct AlphabetBuffers {
+    std::vector<std::uint8_t> cipher_indices;
+    std::vector<std::uint8_t> letter_mask;
+  };
+  std::vector<AlphabetBuffers> alphabet_buffers(alphabets.size());
+  for (std::size_t i = 0; i < alphabets.size(); ++i) {
+    auto &buffers = alphabet_buffers[i];
+    buffers.cipher_indices.resize(text_len);
+    buffers.letter_mask.resize(text_len);
+    for (std::size_t j = 0; j < text_len; ++j) {
+      char c = cipher[j];
+      if (c >= 'A' && c <= 'Z') {
+        int idx = alphabet_index(alphabets[i], c);
+        if (idx >= 0) {
+          buffers.cipher_indices[j] = static_cast<std::uint8_t>(idx);
+          buffers.letter_mask[j] = 1;
+        } else {
+          buffers.cipher_indices[j] = 0;
+          buffers.letter_mask[j] = 0;
+        }
+      } else {
+        buffers.cipher_indices[j] = 0;
+        buffers.letter_mask[j] = 0;
+      }
+    }
+  }
+
+  std::vector<std::uint8_t> key_indices;
+  std::vector<std::uint8_t> key_valid;
+  std::vector<std::uint8_t> plaintext_indices(text_len);
+#if defined(__AVX2__)
+  std::vector<KeyBlock> key_blocks;
+#endif
+  for (std::size_t idx = begin; idx < end; ++idx)
   {
 
     const std::string &key_word = keys[idx];
-    for (auto i = 0; i < alphabets.size(); i++) 
+    for (std::size_t i = 0; i < alphabets.size(); ++i)
     {
         const auto& alphabet = alphabets[i];
+        const auto &buffers = alphabet_buffers[i];
 
-      for (Mode mode : modes) 
+      for (Mode mode : modes)
       {
         std::string plaintext =
-            decrypt_repeating(cipher, key_word, alphabet, mode);
+            decrypt_repeating(cipher, key_word, alphabet, mode,
+                              buffers.cipher_indices, buffers.letter_mask,
+                              key_indices, key_valid, plaintext_indices
+#if defined(__AVX2__)
+                              , key_blocks
+#endif
+                              );
         ++result.combos;
         ++combos_counter;
         if (plaintext.size() < 2) 
