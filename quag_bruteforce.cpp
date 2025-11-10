@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <cmath>
 #include <iomanip>
@@ -15,9 +17,14 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -39,8 +46,16 @@ struct AlphabetCandidate {
   std::string alphabet;
   std::array<int, 26> index_map{};
   std::string base_word;
-  bool reversed = false;
+  bool keyword_reversed = false;
+  bool alphabet_reversed = false;
+  bool keyword_front = true;
 };
+
+#if defined(__AVX2__)
+struct alignas(32) KeyBlock {
+  std::array<std::uint8_t, 32> data{};
+};
+#endif
 
 struct Candidate {
   double score = 0.0;
@@ -50,22 +65,34 @@ struct Candidate {
   Mode mode = Mode::kVigenere;
   bool autokey = false;
   std::string alphabet_word;
-  bool alphabet_reversed = false;
+  bool alphabet_keyword_reversed = false;
+  bool alphabet_base_reversed = false;
+  bool alphabet_keyword_front = true;
   std::string alphabet_string;
   std::string first2;
   std::string plaintext_preview;
+  int spacing_matches = -1;
+  int spacing_total = 0;
 };
 
 struct Options {
   std::string ciphertext;
   std::string wordlist;
+  std::string alphabet_wordlist;
   std::string two_letter_list;
+  std::string spacing_wordlist;
+  std::string spacing_guide;
   std::size_t max_results = 50;
   std::size_t preview_length = 80;
   std::size_t threads = std::max<std::size_t>(1, std::thread::hardware_concurrency());
   bool include_autokey = false;
   double progress_interval_seconds = 1.0;
   bool quiet = false;
+  bool include_keyword_front = true;
+  bool include_reversed_keyword_front = true;
+  bool include_keyword_back = true;
+  bool include_keyword_front_reversed_alphabet = true;
+  bool include_keyword_back_reversed_alphabet = true;
 };
 
 std::string read_file(const std::string &path) {
@@ -127,22 +154,119 @@ std::unordered_set<std::string> build_four_letter_set(const std::vector<std::str
   return result;
 }
 
-std::string build_keyed_alphabet(const std::string &word) {
+std::unordered_map<int, std::unordered_set<std::string>>
+build_words_by_length(const std::vector<std::string> &words) {
+  std::unordered_map<int, std::unordered_set<std::string>> grouped;
+  for (const auto &word : words) {
+    grouped[static_cast<int>(word.size())].insert(word);
+  }
+  return grouped;
+}
+
+std::vector<int> parse_spacing_pattern(const std::string &pattern_text) {
+  std::vector<int> pattern;
+  int current = 0;
+  bool in_number = false;
+  for (char ch : pattern_text) {
+    if (std::isdigit(static_cast<unsigned char>(ch))) {
+      current = current * 10 + (ch - '0');
+      in_number = true;
+    } else {
+      if (in_number) {
+        if (current <= 0) {
+          throw std::runtime_error("Spacing guide values must be positive integers");
+        }
+        pattern.push_back(current);
+        current = 0;
+        in_number = false;
+      }
+    }
+  }
+  if (in_number) {
+    if (current <= 0) {
+      throw std::runtime_error("Spacing guide values must be positive integers");
+    }
+    pattern.push_back(current);
+  }
+  return pattern;
+}
+
+std::pair<int, int> count_spacing_matches(
+    const std::string &plaintext, const std::vector<int> &pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>> &words_by_length) {
+  if (pattern.empty() || words_by_length.empty()) {
+    return {-1, 0};
+  }
+  int matches = 0;
+  int considered = 0;
+  std::size_t offset = 0;
+  for (int length : pattern) {
+    if (length <= 0) {
+      continue;
+    }
+    if (offset + static_cast<std::size_t>(length) > plaintext.size()) {
+      break;
+    }
+    auto it = words_by_length.find(length);
+    if (it == words_by_length.end() || it->second.empty()) {
+      offset += static_cast<std::size_t>(length);
+      continue;
+    }
+    const std::string word = plaintext.substr(offset, static_cast<std::size_t>(length));
+    ++considered;
+    if (it->second.find(word) != it->second.end()) {
+      ++matches;
+    }
+    offset += static_cast<std::size_t>(length);
+  }
+  return {matches, considered};
+}
+
+std::string build_keyed_alphabet(const std::string &word, bool keyword_reversed,
+                                 bool alphabet_reversed, bool keyword_front) {
   std::array<bool, 26> seen{};
-  std::string alphabet;
-  alphabet.reserve(26);
-  for (char ch : word) {
+  std::string ordered_word;
+  if (keyword_reversed) {
+    ordered_word.assign(word.rbegin(), word.rend());
+  } else {
+    ordered_word = word;
+  }
+
+  std::string unique_key;
+  unique_key.reserve(ordered_word.size());
+  for (char ch : ordered_word) {
     int idx = ch - 'A';
     if (idx >= 0 && idx < 26 && !seen[idx]) {
       seen[idx] = true;
-      alphabet.push_back(ch);
+      unique_key.push_back(ch);
     }
   }
-  for (int i = 0; i < 26; ++i) {
-    if (!seen[i]) {
-      alphabet.push_back(static_cast<char>('A' + i));
+
+  std::string alphabet;
+  alphabet.reserve(26);
+
+  if (keyword_front) {
+    alphabet.append(unique_key);
+  }
+
+  if (alphabet_reversed) {
+    for (int i = 25; i >= 0; --i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
+    }
+  } else {
+    for (int i = 0; i < 26; ++i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
     }
   }
+
+  if (!keyword_front) {
+    alphabet.append(unique_key);
+  }
+
   return alphabet;
 }
 
@@ -154,16 +278,17 @@ bool same_candidate_identity(const Candidate& a, const Candidate& b)
         && a.alphabet_string == b.alphabet_string;
 }
 
-AlphabetCandidate make_alphabet_candidate(const std::string &word, bool reversed) {
+AlphabetCandidate make_alphabet_candidate(const std::string &word,
+                                          bool keyword_reversed,
+                                          bool alphabet_reversed,
+                                          bool keyword_front) {
   AlphabetCandidate candidate;
   candidate.base_word = word;
-  candidate.reversed = reversed;
-  if (reversed) {
-    std::string reversed_word(word.rbegin(), word.rend());
-    candidate.alphabet = build_keyed_alphabet(reversed_word);
-  } else {
-    candidate.alphabet = build_keyed_alphabet(word);
-  }
+  candidate.keyword_reversed = keyword_reversed;
+  candidate.alphabet_reversed = alphabet_reversed;
+  candidate.keyword_front = keyword_front;
+  candidate.alphabet =
+      build_keyed_alphabet(word, keyword_reversed, alphabet_reversed, keyword_front);
   candidate.index_map.fill(-1);
   for (std::size_t i = 0; i < candidate.alphabet.size(); ++i) {
     char ch = candidate.alphabet[i];
@@ -172,13 +297,35 @@ AlphabetCandidate make_alphabet_candidate(const std::string &word, bool reversed
   return candidate;
 }
 
-std::vector<AlphabetCandidate> build_alphabet_candidates(const std::vector<std::string> &words) {
+std::vector<AlphabetCandidate>
+build_alphabet_candidates(const std::vector<std::string> &words,
+                          const Options &options) {
   std::map<std::string, AlphabetCandidate> unique_map;
   for (const auto &word : words) {
-    AlphabetCandidate forward = make_alphabet_candidate(word, false);
-    unique_map.emplace(forward.alphabet, forward);
-    AlphabetCandidate reversed = make_alphabet_candidate(word, true);
-    unique_map.emplace(reversed.alphabet, reversed);
+    if (options.include_keyword_front) {
+      AlphabetCandidate forward =
+          make_alphabet_candidate(word, false, false, true);
+      unique_map.emplace(forward.alphabet, forward);
+    }
+    if (options.include_reversed_keyword_front) {
+      AlphabetCandidate reversed_key =
+          make_alphabet_candidate(word, true, false, true);
+      unique_map.emplace(reversed_key.alphabet, reversed_key);
+    }
+    if (options.include_keyword_back) {
+      AlphabetCandidate back = make_alphabet_candidate(word, false, false, false);
+      unique_map.emplace(back.alphabet, back);
+    }
+    if (options.include_keyword_front_reversed_alphabet) {
+      AlphabetCandidate rev_alphabet_front =
+          make_alphabet_candidate(word, false, true, true);
+      unique_map.emplace(rev_alphabet_front.alphabet, rev_alphabet_front);
+    }
+    if (options.include_keyword_back_reversed_alphabet) {
+      AlphabetCandidate rev_alphabet_back =
+          make_alphabet_candidate(word, false, true, false);
+      unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
+    }
   }
   std::vector<AlphabetCandidate> result;
   result.reserve(unique_map.size());
@@ -195,37 +342,169 @@ inline int alphabet_index(const AlphabetCandidate &alphabet, char ch) {
   return alphabet.index_map[ch - 'A'];
 }
 
+inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
+                                   std::uint8_t key_idx, Mode mode) {
+  int value = 0;
+  switch (mode) {
+  case Mode::kVigenere:
+    value = static_cast<int>(cipher_idx) - static_cast<int>(key_idx);
+    if (value < 0) {
+      value += 26;
+    }
+    break;
+  case Mode::kBeaufort:
+    value = static_cast<int>(key_idx) - static_cast<int>(cipher_idx);
+    if (value < 0) {
+      value += 26;
+    }
+    break;
+  case Mode::kVariantBeaufort:
+    value = static_cast<int>(cipher_idx) + static_cast<int>(key_idx);
+    if (value >= 26) {
+      value -= 26;
+    }
+    break;
+  }
+  return static_cast<std::uint8_t>(value);
+}
+
 std::string decrypt_repeating(const std::string &cipher, const std::string &key,
                               const AlphabetCandidate &alphabet, Mode mode) {
   if (cipher.empty() || key.empty()) {
     return {};
   }
-  std::string result;
-  result.reserve(cipher.size());
-  const std::string &alph = alphabet.alphabet;
+
+  const std::size_t text_len = cipher.size();
   const std::size_t key_len = key.size();
-  for (std::size_t i = 0; i < cipher.size(); ++i) {
+  const std::string &alph = alphabet.alphabet;
+
+  std::string result = cipher;
+  std::vector<std::uint8_t> cipher_indices(text_len, 0);
+  std::vector<std::uint8_t> letter_mask(text_len, 0);
+
+  for (std::size_t i = 0; i < text_len; ++i) {
     char c = cipher[i];
-    int c_idx = alphabet_index(alphabet, c);
-    int k_idx = alphabet_index(alphabet, key[i % key_len]);
-    if (c_idx < 0 || k_idx < 0) {
-      result.push_back(c);
-      continue;
+    if (c >= 'A' && c <= 'Z') {
+      int idx = alphabet_index(alphabet, c);
+      if (idx >= 0) {
+        cipher_indices[i] = static_cast<std::uint8_t>(idx);
+        letter_mask[i] = 1;
+      }
     }
-    int p_idx = 0;
+  }
+
+  std::vector<std::uint8_t> key_indices(key_len, 0);
+  std::vector<std::uint8_t> key_valid(key_len, 1);
+  for (std::size_t i = 0; i < key_len; ++i) {
+    int idx = alphabet_index(alphabet, key[i]);
+    if (idx < 0) {
+      key_valid[i] = 0;
+      key_indices[i] = 0;
+    } else {
+      key_indices[i] = static_cast<std::uint8_t>(idx);
+    }
+  }
+
+  std::vector<std::uint8_t> plaintext_indices(text_len, 0);
+
+#if defined(__AVX2__)
+  if (text_len >= 32) {
+    std::vector<KeyBlock> key_blocks(key_len);
+    for (std::size_t start = 0; start < key_len; ++start) {
+      auto &block = key_blocks[start];
+      for (std::size_t j = 0; j < block.data.size(); ++j) {
+        block.data[j] = key_indices[(start + j) % key_len];
+      }
+    }
+
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i twenty_six = _mm256_set1_epi8(26);
+    const __m256i twenty_five = _mm256_set1_epi8(25);
+
+    std::size_t vec_index = 0;
+    std::size_t block_offset = 0;
+
     switch (mode) {
     case Mode::kVigenere:
-      p_idx = (c_idx - k_idx + 26) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_sub_epi8(cipher_vec, key_vec);
+        __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+        plain_vec = _mm256_add_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     case Mode::kBeaufort:
-      p_idx = (k_idx - c_idx + 26) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_sub_epi8(key_vec, cipher_vec);
+        __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+        plain_vec = _mm256_add_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     case Mode::kVariantBeaufort:
-      p_idx = (c_idx + k_idx) % 26;
+      while (vec_index + 32 <= text_len) {
+        __m256i cipher_vec = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(cipher_indices.data() + vec_index));
+        __m256i key_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i *>(key_blocks[block_offset].data.data()));
+        __m256i plain_vec = _mm256_add_epi8(cipher_vec, key_vec);
+        __m256i mask = _mm256_cmpgt_epi8(plain_vec, twenty_five);
+        plain_vec = _mm256_sub_epi8(plain_vec, _mm256_and_si256(mask, twenty_six));
+        _mm256_storeu_si256(
+            reinterpret_cast<__m256i *>(plaintext_indices.data() + vec_index),
+            plain_vec);
+        vec_index += 32;
+        block_offset = (block_offset + 32) % key_len;
+      }
       break;
     }
-    result.push_back(alph[p_idx]);
+
+    for (std::size_t i = vec_index; i < text_len; ++i) {
+      if (!letter_mask[i] || !key_valid[i % key_len]) {
+        continue;
+      }
+      plaintext_indices[i] =
+          decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    }
+  } else {
+#endif
+    for (std::size_t i = 0; i < text_len; ++i) {
+      if (!letter_mask[i] || !key_valid[i % key_len]) {
+        continue;
+      }
+      plaintext_indices[i] =
+          decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    }
+#if defined(__AVX2__)
   }
+#endif
+
+  for (std::size_t i = 0; i < text_len; ++i) {
+    if (!letter_mask[i] || !key_valid[i % key_len]) {
+      continue;
+    }
+    std::uint8_t idx = plaintext_indices[i];
+    if (idx < alph.size()) {
+      result[i] = alph[idx];
+    }
+  }
+
   return result;
 }
 
@@ -310,16 +589,20 @@ double chi_square(const std::string &text) {
   return chi;
 }
 
-Candidate make_candidate(const std::string &key_word,
-                         const AlphabetCandidate &alphabet, Mode mode,
-                         bool autokey_variant, const std::string &plaintext,
-                         std::size_t preview_length) {
+Candidate make_candidate(
+    const std::string &key_word, const AlphabetCandidate &alphabet, Mode mode,
+    bool autokey_variant, const std::string &plaintext,
+    std::size_t preview_length, const std::vector<int> *spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_by_length) {
   Candidate cand;
   cand.key = key_word;
   cand.mode = mode;
   cand.autokey = autokey_variant;
   cand.alphabet_word = alphabet.base_word;
-  cand.alphabet_reversed = alphabet.reversed;
+  cand.alphabet_keyword_reversed = alphabet.keyword_reversed;
+  cand.alphabet_base_reversed = alphabet.alphabet_reversed;
+  cand.alphabet_keyword_front = alphabet.keyword_front;
   cand.alphabet_string = alphabet.alphabet;
   cand.first2 = plaintext.substr(0, std::min<std::size_t>(2, plaintext.size()));
   cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
@@ -330,7 +613,21 @@ Candidate make_candidate(const std::string &key_word,
   const double chi_clamped = std::min(400.0, cand.chi);
   const double chi_score = std::max(0.0, 1.0 - chi_clamped / 400.0);
   const double quality_factor = 0.1 + 0.9 * chi_score;
-  cand.score = ioc_score * quality_factor;
+  const double stats_score = ioc_score * quality_factor;
+  const double word_weight = 0.8;
+  const double stats_weight = 1.0 - word_weight;
+  cand.score = stats_score;
+  if (spacing_pattern && spacing_words_by_length) {
+    auto result = count_spacing_matches(plaintext, *spacing_pattern,
+                                        *spacing_words_by_length);
+    cand.spacing_matches = result.first;
+    cand.spacing_total = result.second;
+    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) {
+      double word_score = static_cast<double>(cand.spacing_matches) /
+                          static_cast<double>(cand.spacing_total);
+      cand.score = word_weight * word_score + stats_weight * stats_score;
+    }
+  }
   return cand;
 }
 
@@ -388,10 +685,22 @@ Options parse_options(int argc, char *argv[]) {
       options.wordlist = read_file(require_value(arg));
     } else if (arg == "--wordlist-inline") {
       options.wordlist = require_value(arg);
+    } else if (arg == "--alphabet-wordlist") {
+      options.alphabet_wordlist = read_file(require_value(arg));
+    } else if (arg == "--alphabet-wordlist-inline") {
+      options.alphabet_wordlist = require_value(arg);
     } else if (arg == "--two-letter-list") {
       options.two_letter_list = read_file(require_value(arg));
     } else if (arg == "--two-letter-inline") {
       options.two_letter_list = require_value(arg);
+    } else if (arg == "--spacing-wordlist") {
+      options.spacing_wordlist = read_file(require_value(arg));
+    } else if (arg == "--spacing-wordlist-inline") {
+      options.spacing_wordlist = require_value(arg);
+    } else if (arg == "--spacing-guide") {
+      options.spacing_guide = require_value(arg);
+    } else if (arg == "--spacing-guide-file") {
+      options.spacing_guide = read_file(require_value(arg));
     } else if (arg == "--max-results") {
       options.max_results = static_cast<std::size_t>(std::stoul(require_value(arg)));
     } else if (arg == "--preview-length") {
@@ -404,6 +713,16 @@ Options parse_options(int argc, char *argv[]) {
       options.progress_interval_seconds = std::stod(require_value(arg));
     } else if (arg == "--quiet") {
       options.quiet = true;
+    } else if (arg == "--no-keyword-front") {
+      options.include_keyword_front = false;
+    } else if (arg == "--no-reversed-keyword-front") {
+      options.include_reversed_keyword_front = false;
+    } else if (arg == "--no-keyword-back") {
+      options.include_keyword_back = false;
+    } else if (arg == "--no-keyword-front-reversed") {
+      options.include_keyword_front_reversed_alphabet = false;
+    } else if (arg == "--no-keyword-back-reversed") {
+      options.include_keyword_back_reversed_alphabet = false;
     } else if (arg == "--help" || arg == "-h") {
       std::cout << "Quagmire III wordlist bruteforcer (C++)\n"
                 << "Options:\n"
@@ -411,14 +730,25 @@ Options parse_options(int argc, char *argv[]) {
                 << "  --ciphertext-file <path>        File containing ciphertext\n"
                 << "  --wordlist <path>               Main wordlist file (required)\n"
                 << "  --wordlist-inline <text>        Inline wordlist string\n"
+                << "  --alphabet-wordlist <path>      Alphabet wordlist file (defaults to main)\n"
+                << "  --alphabet-wordlist-inline <text> Inline alphabet wordlist string\n"
                 << "  --two-letter-list <path>        Optional 2-letter filter list\n"
                 << "  --two-letter-inline <text>      Inline 2-letter filter string\n"
+                << "  --spacing-wordlist <path>       Wordlist used for spacing guide scoring\n"
+                << "  --spacing-wordlist-inline <text> Inline spacing wordlist string\n"
+                << "  --spacing-guide <pattern>       Word length pattern (e.g. 2-4-3-3)\n"
+                << "  --spacing-guide-file <path>     File containing word length pattern\n"
                 << "  --max-results <N>               Max candidates to keep (default 50)\n"
                 << "  --preview-length <N>            Plaintext preview length (default 80)\n"
                 << "  --threads <N>                   Worker threads (default hardware)\n"
                 << "  --include-autokey               Try autokey variants too\n"
                 << "  --progress-interval <sec>       Progress update interval (default 1.0)\n"
                 << "  --quiet                         Suppress periodic progress output\n"
+                << "  --no-keyword-front              Skip key prefix on normal alphabet\n"
+                << "  --no-reversed-keyword-front     Skip reversed key prefix variant\n"
+                << "  --no-keyword-back               Skip key suffix on normal alphabet\n"
+                << "  --no-keyword-front-reversed     Skip key prefix on reversed alphabet\n"
+                << "  --no-keyword-back-reversed      Skip key suffix on reversed alphabet\n"
                 << "  --help                          Show this help message\n";
       std::exit(0);
     } else {
@@ -432,8 +762,22 @@ Options parse_options(int argc, char *argv[]) {
   if (options.wordlist.empty()) {
     throw std::runtime_error("Wordlist is required (use --wordlist or --wordlist-inline)");
   }
+  if (options.alphabet_wordlist.empty()) {
+    options.alphabet_wordlist = options.wordlist;
+  }
+  if (!options.spacing_guide.empty() && options.spacing_wordlist.empty()) {
+    throw std::runtime_error(
+        "Spacing guide provided but spacing wordlist is missing (use --spacing-wordlist)");
+  }
   if (options.threads == 0) {
     options.threads = 1;
+  }
+  if (!options.include_keyword_front && !options.include_reversed_keyword_front &&
+      !options.include_keyword_back &&
+      !options.include_keyword_front_reversed_alphabet &&
+      !options.include_keyword_back_reversed_alphabet) {
+    throw std::runtime_error(
+        "All alphabet construction variants are disabled. Enable at least one option.");
   }
   return options;
 }
@@ -471,23 +815,37 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
       std::min<std::size_t>({sorted.size(), max_rows, static_cast<std::size_t>(50)});
 
   oss << std::setw(3) << "#" << "  " << std::setw(7) << "Score" << "  "
-      << std::setw(8) << "IoC" << "  " << std::setw(9) << "Chi^2" << "  "
+      << std::setw(7) << "Words" << "  " << std::setw(8) << "IoC" << "  "
+      << std::setw(9) << "Chi^2" << "  "
       << std::left << std::setw(16) << "Cipher" << "  " << std::setw(8)
       << "Autokey" << "  " << std::setw(18) << "Key" << "  " << std::setw(15)
-      << "Alphabet word" << "  " << std::setw(3) << "Rev" << "  "
+      << "Alphabet word" << "  " << std::setw(6) << "KeyRev" << "  "
+      << std::setw(6) << "Base" << "  " << std::setw(4) << "Pos" << "  "
       << "Plaintext" << '\n';
-  oss << std::string(120, '-') << '\n';
+  oss << std::string(140, '-') << '\n';
   for (std::size_t i = 0; i < limit; ++i) {
     const Candidate &cand = *sorted[i];
+    std::string word_summary;
+    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) {
+      word_summary = std::to_string(cand.spacing_matches) + "/" +
+                     std::to_string(cand.spacing_total);
+    } else if (cand.spacing_matches == 0 && cand.spacing_total == 0) {
+      word_summary = "0/0";
+    } else {
+      word_summary = "--";
+    }
     oss << std::right << std::setw(3) << (i + 1) << "  " << std::fixed
         << std::setprecision(3) << std::setw(7) << cand.score << "  "
+        << std::setw(7) << word_summary << "  "
         << std::setprecision(4) << std::setw(8) << cand.ioc << "  "
         << std::setprecision(2) << std::setw(9) << cand.chi << "  "
         << std::left << std::setw(16) << mode_family_name(cand.mode) << "  "
         << std::setw(8) << (cand.autokey ? "Yes" : "No") << "  "
         << std::setw(18) << cand.key << "  " << std::setw(15)
-        << cand.alphabet_word << "  " << std::setw(3)
-        << (cand.alphabet_reversed ? "Y" : "N") << "  "
+        << cand.alphabet_word << "  " << std::setw(6)
+        << (cand.alphabet_keyword_reversed ? "Yes" : "No") << "  "
+        << std::setw(6) << (cand.alphabet_base_reversed ? "Rev" : "Fwd") << "  "
+        << std::setw(4) << (cand.alphabet_keyword_front ? "Pre" : "Suf") << "  "
         << cand.plaintext_preview << '\n';
   }
   return oss.str();
@@ -495,6 +853,16 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
 
 void print_table(const std::vector<Candidate> &candidates, std::size_t max_rows) {
   std::cout << format_results_table(candidates, max_rows);
+}
+
+void write_results_to_file(const std::vector<Candidate> &candidates,
+                           std::size_t max_rows,
+                           const std::string &path) {
+  std::ofstream output(path);
+  if (!output) {
+    throw std::runtime_error("Failed to open results output file: " + path);
+  }
+  output << format_results_table(candidates, max_rows);
 }
 
 struct WorkerResult {
@@ -512,6 +880,9 @@ WorkerResult process_keys(
     const std::unordered_set<std::string>& two_letter_set,
     const std::unordered_set<std::string>& four_letter_set,
     bool have_first2_filter, bool have_second4_filter,
+    const std::vector<int> *spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_by_length,
     std::size_t max_results, std::size_t preview_length,
     bool include_autokey, std::atomic<std::size_t>& combos_counter,
     std::atomic<std::size_t>& autokey_counter,
@@ -549,7 +920,9 @@ WorkerResult process_keys(
           continue;
         }
         Candidate cand = make_candidate(key_word, alphabet, mode, false,
-                                        plaintext, preview_length);
+                                        plaintext, preview_length,
+                                        spacing_pattern,
+                                        spacing_words_by_length);
         maintain_top_results(result.best, cand, max_results);
 
 
@@ -574,8 +947,9 @@ WorkerResult process_keys(
               four_letter_set.find(second4_auto) == four_letter_set.end()) {
             continue;
           }
-          Candidate cand_auto = make_candidate(key_word, alphabet, mode, true,
-                                               plaintext_auto, preview_length);
+          Candidate cand_auto = make_candidate(
+              key_word, alphabet, mode, true, plaintext_auto, preview_length,
+              spacing_pattern, spacing_words_by_length);
           maintain_top_results(result.best, cand_auto, max_results);
         }
       }
@@ -647,18 +1021,51 @@ int main(int argc, char *argv[]) {
     Options options = parse_options(argc, argv);
 
     const std::string cipher = clean_letters(options.ciphertext);
-    const std::vector<std::string> words = parse_wordlist(options.wordlist);
-    if (words.empty()) {
+    const std::vector<std::string> key_words = parse_wordlist(options.wordlist);
+    if (key_words.empty()) {
       throw std::runtime_error("Wordlist is empty after cleaning");
     }
+    const std::vector<std::string> alphabet_words =
+        parse_wordlist(options.alphabet_wordlist);
+    if (alphabet_words.empty()) {
+      throw std::runtime_error(
+          "Alphabet wordlist is empty after cleaning");
+    }
+    std::vector<std::string> spacing_words;
+    if (!options.spacing_wordlist.empty()) {
+      spacing_words = parse_wordlist(options.spacing_wordlist);
+      if (spacing_words.empty()) {
+        throw std::runtime_error(
+            "Spacing wordlist is empty after cleaning");
+      }
+    }
+    std::vector<int> spacing_pattern;
+    std::unordered_map<int, std::unordered_set<std::string>>
+        spacing_words_by_length;
+    if (!options.spacing_guide.empty()) {
+      spacing_pattern = parse_spacing_pattern(options.spacing_guide);
+      if (spacing_pattern.empty()) {
+        throw std::runtime_error(
+            "Spacing guide did not contain any valid word lengths");
+      }
+      if (spacing_words.empty()) {
+        throw std::runtime_error(
+            "Spacing guide requires a spacing wordlist");
+      }
+      spacing_words_by_length = build_words_by_length(spacing_words);
+    }
+    const bool spacing_scoring_enabled =
+        !spacing_pattern.empty() && !spacing_words_by_length.empty();
     const std::unordered_set<std::string> two_letter_set =
         parse_two_letter_list(options.two_letter_list);
-    const std::unordered_set<std::string> four_letter_set =
-        build_four_letter_set(words);
+    const std::unordered_set<std::string> four_letter_set = !spacing_words.empty()
+                                                                ? build_four_letter_set(spacing_words)
+                                                                : build_four_letter_set(key_words);
     const bool have_first2_filter = !two_letter_set.empty();
     const bool have_second4_filter = !four_letter_set.empty();
 
-    std::vector<AlphabetCandidate> alphabets = build_alphabet_candidates(words);
+    std::vector<AlphabetCandidate> alphabets =
+        build_alphabet_candidates(alphabet_words, options);
     if (alphabets.empty()) {
       throw std::runtime_error("No alphabet candidates generated from wordlist");
     }
@@ -666,10 +1073,11 @@ int main(int argc, char *argv[]) {
     std::vector<Mode> modes = {Mode::kVigenere, Mode::kBeaufort,
                                Mode::kVariantBeaufort};
 
-    const std::size_t total_combos = words.size() * alphabets.size() * modes.size();
+    const std::size_t total_combos =
+        key_words.size() * alphabets.size() * modes.size();
 
     std::cout << "Cipher length: " << cipher.size() << '\n';
-    std::cout << "Key candidates: " << words.size() << '\n';
+    std::cout << "Key candidates: " << key_words.size() << '\n';
     std::cout << "Alphabet candidates: " << alphabets.size() << '\n';
     std::cout << "Modes per key: " << modes.size() << '\n';
     std::cout << "Total combinations: " << total_combos << '\n';
@@ -684,6 +1092,11 @@ int main(int argc, char *argv[]) {
 
     const std::size_t results_limit =
         std::max<std::size_t>(options.max_results, static_cast<std::size_t>(50));
+    const std::vector<int> *spacing_pattern_ptr =
+        spacing_scoring_enabled ? &spacing_pattern : nullptr;
+    const std::unordered_map<int, std::unordered_set<std::string>>
+        *spacing_words_ptr =
+            spacing_scoring_enabled ? &spacing_words_by_length : nullptr;
 
     std::vector<Candidate> global_results;
     global_results.reserve(results_limit);
@@ -691,8 +1104,8 @@ int main(int argc, char *argv[]) {
 
     std::vector<std::thread> workers;
     const std::size_t thread_count = std::max<std::size_t>(1, options.threads);
-    const std::size_t base_chunk = words.size() / thread_count;
-    const std::size_t remainder = words.size() % thread_count;
+    const std::size_t base_chunk = key_words.size() / thread_count;
+    const std::size_t remainder = key_words.size() % thread_count;
 
     std::atomic<bool> done{false};
     std::thread progress_thread;
@@ -719,8 +1132,9 @@ int main(int argc, char *argv[]) {
       }
       workers.emplace_back([&, begin, end]() {
         WorkerResult worker_result = process_keys(
-            words, begin, end, cipher, alphabets, modes, two_letter_set,
+            key_words, begin, end, cipher, alphabets, modes, two_letter_set,
             four_letter_set, have_first2_filter, have_second4_filter,
+            spacing_pattern_ptr, spacing_words_ptr,
             results_limit, options.preview_length, options.include_autokey,
             combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
         std::lock_guard<std::mutex> lock(results_mutex);
@@ -754,10 +1168,21 @@ int main(int argc, char *argv[]) {
     if (options.include_autokey) {
       std::cout << "Autokey attempts: " << autokey_counter.load() << '\n';
     }
-    std::cout << "Keys processed: " << keys_counter.load() << '/' << words.size()
+    std::cout << "Keys processed: " << keys_counter.load() << '/' << key_words.size()
               << '\n' << std::endl;
 
     print_table(global_results, results_limit);
+    const std::string results_path = "bruteforce_results.txt";
+    try {
+      write_results_to_file(global_results, results_limit, results_path);
+      std::cout << "Results written to " << results_path << '\n';
+    } catch (const std::exception &file_ex) {
+      std::cerr << "Failed to write results file: " << file_ex.what() << '\n';
+    }
+#if defined(_WIN32)
+    std::cout << "Press Enter to exit..." << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+#endif
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;
