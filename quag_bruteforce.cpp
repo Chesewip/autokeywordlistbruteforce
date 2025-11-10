@@ -261,6 +261,16 @@ std::string build_keyed_alphabet(const std::string &word, bool keyword_reversed,
         alphabet.push_back(static_cast<char>('A' + i));
       }
     }
+  } else {
+    for (int i = 0; i < 26; ++i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
+    }
+  }
+
+  if (!keyword_front) {
+    alphabet.append(unique_key);
   }
 
   if (!keyword_front) {
@@ -1225,6 +1235,12 @@ int main(int argc, char *argv[]) {
     return 0;
   } catch (const std::exception &ex) {
     std::cerr << "Error: " << ex.what() << std::endl;
+
+#if defined(_WIN32)
+    std::cout << "Press Enter to exit..." << std::endl;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+#endif
+
     return 1;
   }
 }
