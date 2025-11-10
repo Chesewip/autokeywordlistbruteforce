@@ -39,7 +39,9 @@ struct AlphabetCandidate {
   std::string alphabet;
   std::array<int, 26> index_map{};
   std::string base_word;
-  bool reversed = false;
+  bool keyword_reversed = false;
+  bool alphabet_reversed = false;
+  bool keyword_front = true;
 };
 
 struct Candidate {
@@ -50,7 +52,9 @@ struct Candidate {
   Mode mode = Mode::kVigenere;
   bool autokey = false;
   std::string alphabet_word;
-  bool alphabet_reversed = false;
+  bool alphabet_keyword_reversed = false;
+  bool alphabet_base_reversed = false;
+  bool alphabet_keyword_front = true;
   std::string alphabet_string;
   std::string first2;
   std::string plaintext_preview;
@@ -67,6 +71,11 @@ struct Options {
   bool include_autokey = false;
   double progress_interval_seconds = 1.0;
   bool quiet = false;
+  bool include_keyword_front = true;
+  bool include_reversed_keyword_front = true;
+  bool include_keyword_back = true;
+  bool include_keyword_front_reversed_alphabet = true;
+  bool include_keyword_back_reversed_alphabet = true;
 };
 
 std::string read_file(const std::string &path) {
@@ -128,22 +137,51 @@ std::unordered_set<std::string> build_four_letter_set(const std::vector<std::str
   return result;
 }
 
-std::string build_keyed_alphabet(const std::string &word) {
+std::string build_keyed_alphabet(const std::string &word, bool keyword_reversed,
+                                 bool alphabet_reversed, bool keyword_front) {
   std::array<bool, 26> seen{};
-  std::string alphabet;
-  alphabet.reserve(26);
-  for (char ch : word) {
+  std::string ordered_word;
+  if (keyword_reversed) {
+    ordered_word.assign(word.rbegin(), word.rend());
+  } else {
+    ordered_word = word;
+  }
+
+  std::string unique_key;
+  unique_key.reserve(ordered_word.size());
+  for (char ch : ordered_word) {
     int idx = ch - 'A';
     if (idx >= 0 && idx < 26 && !seen[idx]) {
       seen[idx] = true;
-      alphabet.push_back(ch);
+      unique_key.push_back(ch);
     }
   }
-  for (int i = 0; i < 26; ++i) {
-    if (!seen[i]) {
-      alphabet.push_back(static_cast<char>('A' + i));
+
+  std::string alphabet;
+  alphabet.reserve(26);
+
+  if (keyword_front) {
+    alphabet.append(unique_key);
+  }
+
+  if (alphabet_reversed) {
+    for (int i = 25; i >= 0; --i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
+    }
+  } else {
+    for (int i = 0; i < 26; ++i) {
+      if (!seen[i]) {
+        alphabet.push_back(static_cast<char>('A' + i));
+      }
     }
   }
+
+  if (!keyword_front) {
+    alphabet.append(unique_key);
+  }
+
   return alphabet;
 }
 
@@ -155,16 +193,17 @@ bool same_candidate_identity(const Candidate& a, const Candidate& b)
         && a.alphabet_string == b.alphabet_string;
 }
 
-AlphabetCandidate make_alphabet_candidate(const std::string &word, bool reversed) {
+AlphabetCandidate make_alphabet_candidate(const std::string &word,
+                                          bool keyword_reversed,
+                                          bool alphabet_reversed,
+                                          bool keyword_front) {
   AlphabetCandidate candidate;
   candidate.base_word = word;
-  candidate.reversed = reversed;
-  if (reversed) {
-    std::string reversed_word(word.rbegin(), word.rend());
-    candidate.alphabet = build_keyed_alphabet(reversed_word);
-  } else {
-    candidate.alphabet = build_keyed_alphabet(word);
-  }
+  candidate.keyword_reversed = keyword_reversed;
+  candidate.alphabet_reversed = alphabet_reversed;
+  candidate.keyword_front = keyword_front;
+  candidate.alphabet =
+      build_keyed_alphabet(word, keyword_reversed, alphabet_reversed, keyword_front);
   candidate.index_map.fill(-1);
   for (std::size_t i = 0; i < candidate.alphabet.size(); ++i) {
     char ch = candidate.alphabet[i];
@@ -173,13 +212,35 @@ AlphabetCandidate make_alphabet_candidate(const std::string &word, bool reversed
   return candidate;
 }
 
-std::vector<AlphabetCandidate> build_alphabet_candidates(const std::vector<std::string> &words) {
+std::vector<AlphabetCandidate>
+build_alphabet_candidates(const std::vector<std::string> &words,
+                          const Options &options) {
   std::map<std::string, AlphabetCandidate> unique_map;
   for (const auto &word : words) {
-    AlphabetCandidate forward = make_alphabet_candidate(word, false);
-    unique_map.emplace(forward.alphabet, forward);
-    AlphabetCandidate reversed = make_alphabet_candidate(word, true);
-    unique_map.emplace(reversed.alphabet, reversed);
+    if (options.include_keyword_front) {
+      AlphabetCandidate forward =
+          make_alphabet_candidate(word, false, false, true);
+      unique_map.emplace(forward.alphabet, forward);
+    }
+    if (options.include_reversed_keyword_front) {
+      AlphabetCandidate reversed_key =
+          make_alphabet_candidate(word, true, false, true);
+      unique_map.emplace(reversed_key.alphabet, reversed_key);
+    }
+    if (options.include_keyword_back) {
+      AlphabetCandidate back = make_alphabet_candidate(word, false, false, false);
+      unique_map.emplace(back.alphabet, back);
+    }
+    if (options.include_keyword_front_reversed_alphabet) {
+      AlphabetCandidate rev_alphabet_front =
+          make_alphabet_candidate(word, false, true, true);
+      unique_map.emplace(rev_alphabet_front.alphabet, rev_alphabet_front);
+    }
+    if (options.include_keyword_back_reversed_alphabet) {
+      AlphabetCandidate rev_alphabet_back =
+          make_alphabet_candidate(word, false, true, false);
+      unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
+    }
   }
   std::vector<AlphabetCandidate> result;
   result.reserve(unique_map.size());
@@ -320,7 +381,9 @@ Candidate make_candidate(const std::string &key_word,
   cand.mode = mode;
   cand.autokey = autokey_variant;
   cand.alphabet_word = alphabet.base_word;
-  cand.alphabet_reversed = alphabet.reversed;
+  cand.alphabet_keyword_reversed = alphabet.keyword_reversed;
+  cand.alphabet_base_reversed = alphabet.alphabet_reversed;
+  cand.alphabet_keyword_front = alphabet.keyword_front;
   cand.alphabet_string = alphabet.alphabet;
   cand.first2 = plaintext.substr(0, std::min<std::size_t>(2, plaintext.size()));
   cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
@@ -409,6 +472,16 @@ Options parse_options(int argc, char *argv[]) {
       options.progress_interval_seconds = std::stod(require_value(arg));
     } else if (arg == "--quiet") {
       options.quiet = true;
+    } else if (arg == "--no-keyword-front") {
+      options.include_keyword_front = false;
+    } else if (arg == "--no-reversed-keyword-front") {
+      options.include_reversed_keyword_front = false;
+    } else if (arg == "--no-keyword-back") {
+      options.include_keyword_back = false;
+    } else if (arg == "--no-keyword-front-reversed") {
+      options.include_keyword_front_reversed_alphabet = false;
+    } else if (arg == "--no-keyword-back-reversed") {
+      options.include_keyword_back_reversed_alphabet = false;
     } else if (arg == "--help" || arg == "-h") {
       std::cout << "Quagmire III wordlist bruteforcer (C++)\n"
                 << "Options:\n"
@@ -426,6 +499,11 @@ Options parse_options(int argc, char *argv[]) {
                 << "  --include-autokey               Try autokey variants too\n"
                 << "  --progress-interval <sec>       Progress update interval (default 1.0)\n"
                 << "  --quiet                         Suppress periodic progress output\n"
+                << "  --no-keyword-front              Skip key prefix on normal alphabet\n"
+                << "  --no-reversed-keyword-front     Skip reversed key prefix variant\n"
+                << "  --no-keyword-back               Skip key suffix on normal alphabet\n"
+                << "  --no-keyword-front-reversed     Skip key prefix on reversed alphabet\n"
+                << "  --no-keyword-back-reversed      Skip key suffix on reversed alphabet\n"
                 << "  --help                          Show this help message\n";
       std::exit(0);
     } else {
@@ -444,6 +522,13 @@ Options parse_options(int argc, char *argv[]) {
   }
   if (options.threads == 0) {
     options.threads = 1;
+  }
+  if (!options.include_keyword_front && !options.include_reversed_keyword_front &&
+      !options.include_keyword_back &&
+      !options.include_keyword_front_reversed_alphabet &&
+      !options.include_keyword_back_reversed_alphabet) {
+    throw std::runtime_error(
+        "All alphabet construction variants are disabled. Enable at least one option.");
   }
   return options;
 }
@@ -484,9 +569,10 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
       << std::setw(8) << "IoC" << "  " << std::setw(9) << "Chi^2" << "  "
       << std::left << std::setw(16) << "Cipher" << "  " << std::setw(8)
       << "Autokey" << "  " << std::setw(18) << "Key" << "  " << std::setw(15)
-      << "Alphabet word" << "  " << std::setw(3) << "Rev" << "  "
+      << "Alphabet word" << "  " << std::setw(6) << "KeyRev" << "  "
+      << std::setw(6) << "Base" << "  " << std::setw(4) << "Pos" << "  "
       << "Plaintext" << '\n';
-  oss << std::string(120, '-') << '\n';
+  oss << std::string(140, '-') << '\n';
   for (std::size_t i = 0; i < limit; ++i) {
     const Candidate &cand = *sorted[i];
     oss << std::right << std::setw(3) << (i + 1) << "  " << std::fixed
@@ -496,8 +582,10 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
         << std::left << std::setw(16) << mode_family_name(cand.mode) << "  "
         << std::setw(8) << (cand.autokey ? "Yes" : "No") << "  "
         << std::setw(18) << cand.key << "  " << std::setw(15)
-        << cand.alphabet_word << "  " << std::setw(3)
-        << (cand.alphabet_reversed ? "Y" : "N") << "  "
+        << cand.alphabet_word << "  " << std::setw(6)
+        << (cand.alphabet_keyword_reversed ? "Yes" : "No") << "  "
+        << std::setw(6) << (cand.alphabet_base_reversed ? "Rev" : "Fwd") << "  "
+        << std::setw(4) << (cand.alphabet_keyword_front ? "Pre" : "Suf") << "  "
         << cand.plaintext_preview << '\n';
   }
   return oss.str();
@@ -685,7 +773,7 @@ int main(int argc, char *argv[]) {
     const bool have_second4_filter = !four_letter_set.empty();
 
     std::vector<AlphabetCandidate> alphabets =
-        build_alphabet_candidates(alphabet_words);
+        build_alphabet_candidates(alphabet_words, options);
     if (alphabets.empty()) {
       throw std::runtime_error("No alphabet candidates generated from wordlist");
     }
