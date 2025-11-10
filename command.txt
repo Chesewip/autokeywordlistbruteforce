@@ -1,0 +1,1 @@
+quag_bruteforce_cpp.exe --ciphertext-file "ciphertext.txt" --wordlist "370-thousand-wordlist_english_unknown_unknown.txt" --two-letter-list "2 letter word list.txt" --threads 4 --max-results 50 --include-autokey --preview-length 100

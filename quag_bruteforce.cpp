@@ -146,6 +146,14 @@ std::string build_keyed_alphabet(const std::string &word) {
   return alphabet;
 }
 
+bool same_candidate_identity(const Candidate& a, const Candidate& b)
+{
+    return a.key == b.key
+        && a.mode == b.mode
+        && a.autokey == b.autokey
+        && a.alphabet_string == b.alphabet_string;
+}
+
 AlphabetCandidate make_alphabet_candidate(const std::string &word, bool reversed) {
   AlphabetCandidate candidate;
   candidate.base_word = word;
@@ -328,19 +336,37 @@ Candidate make_candidate(const std::string &key_word,
 
 void maintain_top_results(std::vector<Candidate> &results, const Candidate &candidate,
                           std::size_t max_results) {
-  if (max_results == 0) {
-    return;
-  }
-  if (results.size() < max_results) {
-    results.push_back(candidate);
-    return;
-  }
-  auto worst_it = std::min_element(
-      results.begin(), results.end(),
-      [](const Candidate &a, const Candidate &b) { return a.score < b.score; });
-  if (worst_it != results.end() && worst_it->score < candidate.score) {
-    *worst_it = candidate;
-  }
+    if (max_results == 0) {
+        return;
+    }
+
+    // 1. Check if we already have this identity
+    auto existing = std::find_if(results.begin(), results.end(),
+        [&](const Candidate& c) {
+            return same_candidate_identity(c, candidate);
+        });
+
+    if (existing != results.end()) {
+        // Optional: upgrade if the new one is better
+        if (candidate.score > existing->score) {
+            *existing = candidate;
+        }
+        return; // don't add a duplicate row
+    }
+
+    // 2. Normal insert/replace logic
+    if (results.size() < max_results) {
+        results.push_back(candidate);
+        return;
+    }
+
+    auto worst_it = std::min_element(
+        results.begin(), results.end(),
+        [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
+
+    if (worst_it != results.end() && worst_it->score < candidate.score) {
+        *worst_it = candidate;
+    }
 }
 
 Options parse_options(int argc, char *argv[]) {
@@ -478,44 +504,57 @@ struct WorkerResult {
   std::size_t keys_processed = 0;
 };
 
-WorkerResult process_keys(const std::vector<std::string> &keys, std::size_t begin,
-                          std::size_t end, const std::string &cipher,
-                          const std::vector<AlphabetCandidate> &alphabets,
-                          const std::vector<Mode> &modes,
-                          const std::unordered_set<std::string> &two_letter_set,
-                          const std::unordered_set<std::string> &four_letter_set,
-                          bool have_first2_filter, bool have_second4_filter,
-                          std::size_t max_results, std::size_t preview_length,
-                          bool include_autokey, std::atomic<std::size_t> &combos_counter,
-                          std::atomic<std::size_t> &autokey_counter,
-                          std::atomic<std::size_t> &keys_counter) {
+WorkerResult process_keys(
+    const std::vector<std::string>& keys, std::size_t begin,
+    std::size_t end, const std::string& cipher,
+    const std::vector<AlphabetCandidate>& alphabets,
+    const std::vector<Mode>& modes,
+    const std::unordered_set<std::string>& two_letter_set,
+    const std::unordered_set<std::string>& four_letter_set,
+    bool have_first2_filter, bool have_second4_filter,
+    std::size_t max_results, std::size_t preview_length,
+    bool include_autokey, std::atomic<std::size_t>& combos_counter,
+    std::atomic<std::size_t>& autokey_counter,
+    std::atomic<std::size_t>& keys_counter,
+    std::mutex& results_mutex,
+    std::vector<Candidate>& global_results)
+{
   WorkerResult result;
   result.best.reserve(max_results);
-  for (std::size_t idx = begin; idx < end; ++idx) {
+  for (std::size_t idx = begin; idx < end; ++idx) 
+  {
+
     const std::string &key_word = keys[idx];
-    for (const auto &alphabet : alphabets) {
-      for (Mode mode : modes) {
+    for (auto i = 0; i < alphabets.size(); i++) 
+    {
+        const auto& alphabet = alphabets[i];
+
+      for (Mode mode : modes) 
+      {
         std::string plaintext =
             decrypt_repeating(cipher, key_word, alphabet, mode);
         ++result.combos;
         ++combos_counter;
-        if (plaintext.size() < 2) {
+        if (plaintext.size() < 2) 
+        {
           continue;
         }
-    std::string first2 = plaintext.substr(0, 2);
-    bool apply_second4 = have_second4_filter && plaintext.size() >= 6;
-    std::string second4 = apply_second4 ? plaintext.substr(2, 4) : std::string();
-    if (have_first2_filter && two_letter_set.find(first2) == two_letter_set.end()) {
-      continue;
-    }
-    if (apply_second4 && four_letter_set.find(second4) == four_letter_set.end()) {
-      continue;
-    }
+        std::string first2 = plaintext.substr(0, 2);
+        bool apply_second4 = have_second4_filter && plaintext.size() >= 6;
+        std::string second4 = apply_second4 ? plaintext.substr(2, 4) : std::string();
+        if (have_first2_filter && two_letter_set.find(first2) == two_letter_set.end()) {
+          continue;
+        }
+        if (apply_second4 && four_letter_set.find(second4) == four_letter_set.end()) {
+          continue;
+        }
         Candidate cand = make_candidate(key_word, alphabet, mode, false,
                                         plaintext, preview_length);
         maintain_top_results(result.best, cand, max_results);
 
-        if (include_autokey) {
+
+        if (include_autokey) 
+        {
           std::string plaintext_auto =
               decrypt_autokey(cipher, key_word, alphabet, mode);
           ++result.autokey_attempts;
@@ -543,6 +582,14 @@ WorkerResult process_keys(const std::vector<std::string> &keys, std::size_t begi
     }
     ++result.keys_processed;
     ++keys_counter;
+
+    {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        for (const auto& cand : result.best) 
+        {
+            maintain_top_results(global_results, cand, max_results);
+        }
+    }
   }
   return result;
 }
@@ -574,7 +621,13 @@ void progress_loop(const std::atomic<bool> &done, double interval_seconds,
       snapshot = results;
     }
     std::ostringstream oss;
-    oss << "\033[2J\033[H";
+#if defined(_WIN32)
+    // Simple version: delegate to the shell.
+    std::system("cls");
+#else
+    // ANSI clear + home
+    std::cout << "\033[2J\033[H";
+#endif
     oss << std::fixed << std::setprecision(1) << "Elapsed: " << elapsed
         << "s  Keys: " << keys << "  Combos: " << combos;
     if (total_combos > 0) {
@@ -669,7 +722,7 @@ int main(int argc, char *argv[]) {
             words, begin, end, cipher, alphabets, modes, two_letter_set,
             four_letter_set, have_first2_filter, have_second4_filter,
             results_limit, options.preview_length, options.include_autokey,
-            combos_counter, autokey_counter, keys_counter);
+            combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
         std::lock_guard<std::mutex> lock(results_mutex);
         for (const auto &cand : worker_result.best) {
           maintain_top_results(global_results, cand, results_limit);

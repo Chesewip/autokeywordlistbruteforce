@@ -1,0 +1,16 @@
+Workers: 2  Keys: 1/1  Combos: 6/6  Autokey attempts: 0
+[########################################]  100.0%  elapsed 0.1s
+Best score: 0.000
+
+Top candidates (showing up to 5):
+  #    Score       IoC     Chi^2  Mode                  Key              Alphabet word    Rev  First2  Preview
+--------------------------------------------------------------------------------------------------------------
+Workers: 2  Keys: 1/1  Combos: 6/6  Autokey attempts: 0
+[########################################]  100.0%  elapsed 0.1s
+Best score: 0.000
+
+Top candidates (showing up to 5):
+  #    Score       IoC     Chi^2  Mode                  Key              Alphabet word    Rev  First2  Preview
+--------------------------------------------------------------------------------------------------------------
+Completed in 0.1s. Keys considered: 1/1, alphabets: 2, combos tried: 6/6.
+Autokey decryptions evaluated: 0
