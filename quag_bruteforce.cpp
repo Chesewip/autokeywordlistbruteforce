@@ -132,27 +132,70 @@ std::vector<std::string> parse_wordlist(const std::string &text) {
   return words;
 }
 
-std::unordered_set<std::string> parse_two_letter_list(const std::string &text) {
-  std::unordered_set<std::string> pairs;
-  std::string current;
-  std::istringstream stream(text);
-  while (std::getline(stream, current)) {
-    auto cleaned = clean_letters(current);
-    if (cleaned.size() == 2) {
-      pairs.insert(std::move(cleaned));
-    }
-  }
-  return pairs;
+inline std::uint16_t encode_bigram(char a, char b) {
+    return static_cast<std::uint16_t>((a - 'A') * 26 + (b - 'A'));
 }
 
-std::unordered_set<std::string> build_four_letter_set(const std::vector<std::string> &words) {
-  std::unordered_set<std::string> result;
-  for (const auto &w : words) {
-    if (w.size() == 4) {
-      result.insert(w);
+inline std::uint32_t encode_quad(char a, char b, char c, char d) {
+    // assume A–Z; caller should validate if needed
+    int ia = a - 'A';
+    int ib = b - 'A';
+    int ic = c - 'A';
+    int id = d - 'A';
+
+    // (((a * 26) + b) * 26 + c) * 26 + d
+    return static_cast<std::uint32_t>(
+        (((ia * 26 + ib) * 26 + ic) * 26 + id)
+        );
+}
+
+std::unordered_set<std::uint16_t> parse_two_letter_list(const std::string& text) {
+    std::unordered_set<std::uint16_t> pairs;
+
+    std::string current;
+    std::istringstream stream(text);
+
+    while (std::getline(stream, current)) {
+        auto cleaned = clean_letters(current);  // already uppercases
+        if (cleaned.size() == 2) {
+            char a = cleaned[0];
+            char b = cleaned[1];
+
+            // Optional: be defensive, skip non A–Z
+            if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') {
+                continue;
+            }
+
+            pairs.insert(encode_bigram(a, b));
+        }
     }
-  }
-  return result;
+
+    return pairs;
+}
+
+
+std::unordered_set<std::uint32_t> build_four_letter_set(const std::vector<std::string>& words) 
+{
+    std::unordered_set<std::uint32_t> result;
+    for (const auto& w : words) {
+        if (w.size() == 4) {
+            char a = w[0];
+            char b = w[1];
+            char c = w[2];
+            char d = w[3];
+
+            // be defensive if you like
+            if (a < 'A' || a > 'Z' ||
+                b < 'A' || b > 'Z' ||
+                c < 'A' || c > 'Z' ||
+                d < 'A' || d > 'Z') {
+                continue;
+            }
+
+            result.insert(encode_quad(a, b, c, d));
+        }
+    }
+    return result;
 }
 
 std::unordered_map<int, std::unordered_set<std::string>>
@@ -281,6 +324,22 @@ bool same_candidate_identity(const Candidate& a, const Candidate& b)
         && a.alphabet_string == b.alphabet_string;
 }
 
+std::string build_plaintext_string(const AlphabetCandidate& alphabet,
+    const std::vector<std::uint8_t>& plaintext_indices,
+    std::size_t text_len)
+{
+    std::string result;
+    result.resize(text_len);
+    const std::string& alph = alphabet.alphabet;
+
+    for (std::size_t i = 0; i < text_len; ++i) {
+        std::uint8_t idx = plaintext_indices[i];
+        // assume idx < 26 for valid positions
+        result[i] = alph[idx];
+    }
+    return result;
+}
+
 AlphabetCandidate make_alphabet_candidate(const std::string &word,
                                           bool keyword_reversed,
                                           bool alphabet_reversed,
@@ -376,7 +435,7 @@ inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
   return static_cast<std::uint8_t>(value);
 }
 
-std::string decrypt_repeating(
+void decrypt_repeating(
     const std::string& cipher, const std::string& key,
     const AlphabetCandidate& alphabet, Mode mode,
     const std::vector<std::uint8_t>& cipher_indices,   // precomputed per alphabet
@@ -489,6 +548,7 @@ std::string decrypt_repeating(
         }
 #endif
 
+    /*
     // map plaintext indices back to letters – only up to text_len (85)
     for (std::size_t i = 0; i < kTextLen; ++i) {
         if (!letter_mask[i] || !key_valid[i % key_len]) continue;
@@ -497,48 +557,43 @@ std::string decrypt_repeating(
     }
 
     return result;
+    */
 }
 
 
-std::string decrypt_autokey(const std::string &cipher, const std::string &key,
-                            const AlphabetCandidate &alphabet, Mode mode) {
-  if (cipher.empty() || key.empty()) {
-    return {};
-  }
-  std::string result;
-  result.reserve(cipher.size());
-  const std::string &alph = alphabet.alphabet;
-  const std::size_t key_len = key.size();
-  for (std::size_t i = 0; i < cipher.size(); ++i) {
-    char c = cipher[i];
-    int c_idx = alphabet_index(alphabet, c);
-    char k_char;
-    if (i < key_len) {
-      k_char = key[i];
-    } else {
-      k_char = result[i - key_len];
+void decrypt_autokey(
+    const std::vector<std::uint8_t>& cipher_indices,  // size = text_len
+    const std::vector<std::uint8_t>& key_indices,     // size = key_len
+    std::vector<std::uint8_t>& plaintext_indices,     // scratch out
+    Mode mode)
+{
+    const std::size_t n = cipher_indices.size();
+    const std::size_t key_len = key_indices.size();
+
+    if (n == 0 || key_len == 0) {
+        plaintext_indices.clear();
+        return;
     }
-    int k_idx = alphabet_index(alphabet, k_char);
-    if (c_idx < 0 || k_idx < 0) {
-      result.push_back(c);
-      continue;
+
+    plaintext_indices.resize(n);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint8_t c_idx = cipher_indices[i];
+        std::uint8_t k_idx;
+
+        if (i < key_len) {
+            // normal key period
+            k_idx = key_indices[i];
+        }
+        else {
+            // autokey: use previous plaintext symbol
+            k_idx = plaintext_indices[i - key_len];
+        }
+
+        plaintext_indices[i] = decrypt_symbol(c_idx, k_idx, mode);
     }
-    int p_idx = 0;
-    switch (mode) {
-    case Mode::kVigenere:
-      p_idx = (c_idx - k_idx + 26) % 26;
-      break;
-    case Mode::kBeaufort:
-      p_idx = (k_idx - c_idx + 26) % 26;
-      break;
-    case Mode::kVariantBeaufort:
-      p_idx = (c_idx + k_idx) % 26;
-      break;
-    }
-    result.push_back(alph[p_idx]);
-  }
-  return result;
 }
+
 
 double index_of_coincidence(const std::string &text) {
   const std::size_t n = text.size();
@@ -581,6 +636,50 @@ double chi_square(const std::string &text) {
   return chi;
 }
 
+void compute_stats_indices(const std::uint8_t* plain,
+    std::size_t n,
+    const AlphabetCandidate& alphabet,
+    double& out_ioc,
+    double& out_chi)
+{
+    if (n <= 1) {
+        out_ioc = 0.0;
+        out_chi = std::numeric_limits<double>::infinity();
+        return;
+    }
+
+    const std::string& alph = alphabet.alphabet; // keyed alphabet
+
+    std::array<std::size_t, 26> counts{};
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint8_t idx = plain[i];
+        if (idx < 26) {
+            char ch = alph[idx];  // map keyed index  actual letter
+            if (ch >= 'A' && ch <= 'Z') {
+                counts[static_cast<std::size_t>(ch - 'A')]++;
+            }
+        }
+    }
+
+    double numerator = 0.0;
+    double chi = 0.0;
+
+    for (std::size_t i = 0; i < 26; ++i) {
+        std::size_t c = counts[i];
+        numerator += static_cast<double>(c) * static_cast<double>(c - 1);
+
+        double expected = static_cast<double>(n) * kEnglishFreq[i];
+        if (expected > 0.0) {
+            double diff = static_cast<double>(c) - expected;
+            chi += (diff * diff) / expected;
+        }
+    }
+
+    out_ioc = numerator / (static_cast<double>(n) * static_cast<double>(n - 1));
+    out_chi = chi;
+}
+
+
 void compute_stats(const std::string& text, double& out_ioc, double& out_chi) {
     const std::size_t n = text.size();
     if (n <= 1) {
@@ -614,11 +713,17 @@ void compute_stats(const std::string& text, double& out_ioc, double& out_chi) {
 }
 
 Candidate make_candidate(
-    const std::string &key_word, const AlphabetCandidate &alphabet, Mode mode,
-    bool autokey_variant, const std::string &plaintext,
-    std::size_t preview_length, const std::vector<int> *spacing_pattern,
-    const std::unordered_map<int, std::unordered_set<std::string>>
-        *spacing_words_by_length) {
+    const std::string &key_word, 
+    const AlphabetCandidate &alphabet, Mode mode,
+    bool autokey_variant, 
+    const std::string &plaintext,
+    std::size_t preview_length, 
+    const std::vector<int> *spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>> *spacing_words_by_length,
+    double ioc, 
+    double chi2) 
+{
+
   Candidate cand;
   cand.key = key_word;
   cand.mode = mode;
@@ -628,7 +733,8 @@ Candidate make_candidate(
   cand.alphabet_base_reversed = alphabet.alphabet_reversed;
   cand.alphabet_keyword_front = alphabet.keyword_front;
   cand.alphabet_string = alphabet.alphabet;
-  //cand.first2 = plaintext.substr(0, std::min<std::size_t>(2, plaintext.size()));
+  cand.ioc = ioc;
+  cand.chi = chi2;
   cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
   compute_stats(plaintext, cand.ioc, cand.chi);
 
@@ -899,8 +1005,9 @@ bool passes_front_filters_repeating(
     Mode mode,
     bool have_first2_filter,
     bool have_second4_filter,
-    const std::unordered_set<std::string>& two_letter_set,
-    const std::unordered_set<std::string>& four_letter_set)
+    const std::unordered_set<std::uint16_t>& two_letter_set,
+    const std::unordered_set<std::uint32_t>& four_letter_set, 
+    std::unordered_set<std::uint16_t>& trash_letter_set)
 {
     const std::size_t text_len = cipher.size();
     if (text_len < 2) {
@@ -950,15 +1057,35 @@ bool passes_front_filters_repeating(
     }
 
     if (have_first2_filter) {
-        std::string first2(buf, buf + 2);
-        if (two_letter_set.find(first2) == two_letter_set.end()) {
+        char a = buf[0];
+        char b = buf[1];
+        if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') {
+            // definitely not in two_letter_codes
+            return false;
+        }
+        std::uint16_t code = encode_bigram(a, b);
+        if (two_letter_set.find(code) == two_letter_set.end()) 
+        {
+            trash_letter_set.insert(code);
             return false;
         }
     }
 
     if (have_second4_filter && produced >= 6) {
-        std::string second4(buf + 2, buf + 6);
-        if (four_letter_set.find(second4) == four_letter_set.end()) {
+        char a = buf[2];
+        char b = buf[3];
+        char c = buf[4];
+        char d = buf[5];
+
+        if (a < 'A' || a > 'Z' ||
+            b < 'A' || b > 'Z' ||
+            c < 'A' || c > 'Z' ||
+            d < 'A' || d > 'Z') {
+            return false;
+        }
+
+        std::uint32_t code4 = encode_quad(a, b, c, d);
+        if (four_letter_set.find(code4) == four_letter_set.end()) {
             return false;
         }
     }
@@ -979,8 +1106,8 @@ WorkerResult process_keys(
     std::size_t end, const std::string& cipher,
     const std::vector<AlphabetCandidate>& alphabets,
     const std::vector<Mode>& modes,
-    const std::unordered_set<std::string>& two_letter_set,
-    const std::unordered_set<std::string>& four_letter_set,
+    const std::unordered_set<std::uint16_t>& two_letter_set,
+    const std::unordered_set<std::uint32_t>& four_letter_set,
     bool have_first2_filter, bool have_second4_filter,
     const std::vector<int>* spacing_pattern,
     const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
@@ -1037,7 +1164,8 @@ WorkerResult process_keys(
                 : 0;
         }
 
-        const bool last_alphabet = (a + 1 == alphabet_count);
+        //std::unordered_map<Mode, std::unordered_set<std::string>> trashBigramMap;
+        std::unordered_map<Mode, std::unordered_set<std::uint16_t>> trashBigramMap;
 
         // Inner: keys assigned to this worker
         for (std::size_t idx = begin; idx < end; ++idx) {
@@ -1046,7 +1174,8 @@ WorkerResult process_keys(
 
             key_indices.resize(key_word.size());
             key_valid.resize(key_word.size());
-            for (std::size_t i = 0; i < key_word.size(); ++i) {
+            for (std::size_t i = 0; i < key_word.size(); ++i) 
+            {
                 int idx = alphabet_index(alphabet, key_word[i]);
                 if (idx < 0) {
                     key_valid[i] = 0;
@@ -1058,13 +1187,27 @@ WorkerResult process_keys(
                 }
             }
 
+            std::uint16_t key_bigram_code = 0;
+            bool has_bigram = key_word.size() >= 2;
+            if (has_bigram) {
+                char a = key_word[0];
+                char b = key_word[1];
+                // assume already uppercase
+                key_bigram_code = encode_bigram(a, b);
+            }
+
             bool keyblockBuilt = false;
 
             for (Mode mode : modes) 
             {
-
                 ++result.combos;
                 ++combos_counter;
+
+                auto& trashSet = trashBigramMap[mode];
+
+                if (has_bigram && trashSet.find(key_bigram_code) != trashSet.end()) {
+                    continue;
+                }
 
                 if ((have_first2_filter || have_second4_filter) &&
                     !passes_front_filters_repeating(
@@ -1075,7 +1218,8 @@ WorkerResult process_keys(
                         have_first2_filter,
                         have_second4_filter,
                         two_letter_set,
-                        four_letter_set))
+                        four_letter_set,
+                        trashSet))
                 {
                     continue; // reject this (key, alphabet, mode) without full decrypt
                 }
@@ -1097,7 +1241,6 @@ WorkerResult process_keys(
                 }
 #endif
 
-                std::string plaintext =
                     decrypt_repeating(cipher, key_word, alphabet, mode,
                         cipher_indices, letter_mask,
                         key_indices, key_valid,
@@ -1107,23 +1250,68 @@ WorkerResult process_keys(
 #endif
                     );
 
-                Candidate cand = make_candidate(
-                    key_word, alphabet, mode, false,
-                    plaintext, preview_length,
-                    spacing_pattern, spacing_words_by_length);
-                maintain_top_results(result.best, cand, max_results);
+                double ioc, chi;
+                compute_stats_indices(plaintext_indices.data(), text_len, alphabet, ioc, chi);
 
-                if (include_autokey) {
-                    std::string plaintext_auto =
-                        decrypt_autokey(cipher, key_word, alphabet, mode);
+                // coarse gate: only pay for full string+spacing for promising stats
+                // tune these thresholds as you like
+                if (ioc > 0.05 && chi < 160.0) 
+                {
+                    std::string plaintext = build_plaintext_string(alphabet, plaintext_indices, text_len);
+
+                    Candidate cand = make_candidate(
+                        key_word, alphabet, mode, false,
+                        plaintext, preview_length,
+                        spacing_pattern, spacing_words_by_length, ioc, chi);
+                    maintain_top_results(result.best, cand, 10);
+                }
+
+
+                if (include_autokey) 
+                 {
                     ++result.autokey_attempts;
                     ++autokey_counter;
 
-                    Candidate cand_auto = make_candidate(
-                        key_word, alphabet, mode, true,
-                        plaintext_auto, preview_length,
-                        spacing_pattern, spacing_words_by_length);
-                    maintain_top_results(result.best, cand_auto, max_results);
+                    // reuse the same cipher_indices and key_indices we already built
+                    std::vector<std::uint8_t> plaintext_indices_autokey; // or reuse the same scratch
+
+                    decrypt_autokey(
+                        cipher_indices,
+                        key_indices,
+                        plaintext_indices_autokey,
+                        mode);
+
+                    double ioc_auto = 0.0, chi_auto = 0.0;
+                    const std::size_t text_len = cipher.size(); // 85 for your Quag 3
+
+                    compute_stats_indices(
+                        plaintext_indices_autokey.data(),
+                        text_len,
+                        alphabet,
+                        ioc_auto,
+                        chi_auto);
+
+                    // cheap “quality gate” on stats before we pay for string/spacer work
+                    if (ioc_auto > 0.05 && chi_auto < 160.0) 
+                    {
+                        // map indices letters only for promising candidates
+                        std::string plaintext_auto =
+                            build_plaintext_string(alphabet, plaintext_indices_autokey, text_len);
+
+                        Candidate cand_auto = make_candidate(
+                            key_word,
+                            alphabet,
+                            mode,
+                            /*autokey_variant=*/true,
+                            plaintext_auto,
+                            preview_length,
+                            spacing_pattern,
+                            spacing_words_by_length,
+                            ioc_auto,
+                            chi_auto);
+
+                        maintain_top_results(result.best, cand_auto, max_results);
+                    }
                 }
             }
 
@@ -1242,11 +1430,12 @@ int main(int argc, char *argv[]) {
     }
     const bool spacing_scoring_enabled =
         !spacing_pattern.empty() && !spacing_words_by_length.empty();
-    const std::unordered_set<std::string> two_letter_set =
+    const std::unordered_set<std::uint16_t> two_letter_set =
         parse_two_letter_list(options.two_letter_list);
-    const std::unordered_set<std::string> four_letter_set = !spacing_words.empty()
-                                                                ? build_four_letter_set(spacing_words)
-                                                                : build_four_letter_set(key_words);
+    const std::unordered_set<std::uint32_t> four_letter_set = !spacing_words.empty()
+        ? build_four_letter_set(spacing_words)
+        : build_four_letter_set(key_words);
+
     const bool have_first2_filter = !two_letter_set.empty();
     const bool have_second4_filter = !four_letter_set.empty();
 
