@@ -2,19 +2,15 @@ AM
 AN
 AS
 AT
-AW
 BE
 BY
 DO
-ET
-HA
 HE
 HI
 IF
 IN
 IS
 IT
-LA
 MA
 ME
 MY
@@ -24,9 +20,7 @@ OH
 OK
 ON
 OR
-OX
 PA
-RA
 SO
 TO
 UH
@@ -35,7 +29,3 @@ UP
 UN
 US
 WE
-YA
-YE
-YO
-OZ
