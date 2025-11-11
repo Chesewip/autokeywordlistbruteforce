@@ -1,0 +1,1 @@
+./quag_bruteforce_cpp --ciphertext-file "ciphertext.txt" --wordlist "./Word Lists/370kwords.txt" --two-letter-list "./Word Lists/2wordharsh.txt" --alphabet-wordlist "./Word Lists/370kwords.txt" --spacing-guide-file "spacingguideline.txt"  --spacing-wordlist "./Word Lists/370kwords.txt" --threads 48 --max-results 50 --include-autokey --preview-length 150
