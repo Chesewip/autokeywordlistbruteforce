@@ -1,13 +1,10 @@
 # Quagmire III Wordlist Bruteforcer (CLI)
 
-This repository packages a terminal version of the Quagmire III wordlist solver that originally shipped as a browser tool (`quagmire_3_wordlist_solver (1).html`).
-Both a Python script (`quag_bruteforce.py`) and a standalone C++ implementation (`quag_bruteforce.cpp`) reproduce the keyed alphabet enumeration,
-cipher family decryptors (Vigenère, Beaufort, variant Beaufort, and their autokey variants), and the scoring heuristics used by the HTML worker.
-Use them to explore candidate plaintexts directly from your shell or deploy them on bare-bones machines.
+It runs a lot of vigenere ciphers dawg. 
 
 ## C++ command-line solver
 
-The new `quag_bruteforce.cpp` binary is designed for fast, multi-threaded searches on systems where Python is undesirable or unavailable.
+The new `quag_bruteforce.cpp` binary is designed for fast, multi-threaded searches.
 
 ### Build
 
@@ -19,13 +16,10 @@ g++ -std=c++17 -O3 -pthread -o quag_bruteforce_cpp quag_bruteforce.cpp
 
 ### Usage
 
+Something like this 
+
 ```bash
-./quag_bruteforce_cpp \
-    --ciphertext RIJVSUYVJN \
-    --wordlist-inline $'KEY\nLEMON\nALPHA' \
-    --two-letter-inline HE \
-    --threads 4 \
-    --max-results 25
+./quag_bruteforce_cpp --ciphertext-file "ciphertext.txt" --wordlist "./Word Lists/370kwords.txt" --two-letter-list "./Word Lists/2wordharsh.txt" --alphabet-wordlist "./Word Lists/370kwords.txt" --spacing-guide-file "spacingguideline.txt"  --spacing-wordlist "./Word Lists/370kwords.txt" --threads 48 --max-results 50 --include-autokey --preview-length 150
 ```
 
 Key flags:

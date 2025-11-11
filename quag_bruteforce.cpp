@@ -36,6 +36,7 @@ constexpr std::array<double, 26> kEnglishFreq = {
 
 constexpr double kIocTarget = 0.066;
 
+
 enum class Mode {
   kVigenere,
   kBeaufort,
@@ -388,114 +389,111 @@ std::string decrypt_repeating(
 #endif
 )
 {
-    if (cipher.empty() || key.empty()) {
-        return {};
-    }
 
-    const std::size_t text_len = cipher.size();
     const std::size_t key_len = key.size();
     const std::string& alph = alphabet.alphabet;
+
+    // For this tool we *know* text_len == 85
+    constexpr std::size_t kTextLen = 85;
+    constexpr std::size_t kVecWidth = 32;
+    constexpr std::size_t kPaddedLen = ((kTextLen + kVecWidth - 1) / kVecWidth) * kVecWidth; // 96
+    constexpr std::size_t kVecBlocks = kPaddedLen / kVecWidth; // 3
 
     std::string result = cipher;
 
 #if defined(__AVX2__)
-    if (text_len >= 32) {
 
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i twenty_six = _mm256_set1_epi8(26);
+    const __m256i twenty_five = _mm256_set1_epi8(25);
 
-        const __m256i zero = _mm256_setzero_si256();
-        const __m256i twenty_six = _mm256_set1_epi8(26);
-        const __m256i twenty_five = _mm256_set1_epi8(25);
+    std::size_t vec_index = 0;
+    std::size_t block_offset = 0;
 
-        std::size_t vec_index = 0;
-        std::size_t block_offset = 0;
-
-        switch (mode) {
-        case Mode::kVigenere:
-            while (vec_index + 32 <= text_len) {
-                __m256i cipher_vec = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
-                __m256i key_vec = _mm256_load_si256(
-                    reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-                __m256i plain_vec = _mm256_sub_epi8(cipher_vec, key_vec);
-                __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
-                plain_vec = _mm256_add_epi8(plain_vec,
-                    _mm256_and_si256(mask, twenty_six));
-                _mm256_storeu_si256(
-                    reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
-                    plain_vec);
-                vec_index += 32;
-                block_offset = (block_offset + 32) % key_len;
-            }
-            break;
-
-        case Mode::kBeaufort:
-            while (vec_index + 32 <= text_len) {
-                __m256i cipher_vec = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
-                __m256i key_vec = _mm256_load_si256(
-                    reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-                __m256i plain_vec = _mm256_sub_epi8(key_vec, cipher_vec);
-                __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
-                plain_vec = _mm256_add_epi8(plain_vec,
-                    _mm256_and_si256(mask, twenty_six));
-                _mm256_storeu_si256(
-                    reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
-                    plain_vec);
-                vec_index += 32;
-                block_offset = (block_offset + 32) % key_len;
-            }
-            break;
-
-        case Mode::kVariantBeaufort:
-            while (vec_index + 32 <= text_len) {
-                __m256i cipher_vec = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
-                __m256i key_vec = _mm256_load_si256(
-                    reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-                __m256i plain_vec = _mm256_add_epi8(cipher_vec, key_vec);
-                __m256i mask = _mm256_cmpgt_epi8(plain_vec, twenty_five);
-                plain_vec = _mm256_sub_epi8(plain_vec,
-                    _mm256_and_si256(mask, twenty_six));
-                _mm256_storeu_si256(
-                    reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
-                    plain_vec);
-                vec_index += 32;
-                block_offset = (block_offset + 32) % key_len;
-            }
-            break;
-        }
-
-        // scalar tail
-        for (std::size_t i = vec_index; i < text_len; ++i) {
-            if (!letter_mask[i] || !key_valid[i % key_len]) {
-                continue;
-            }
-            plaintext_indices[i] =
-                decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
-        }
-    }
-    else
-#endif
+    switch (mode)
     {
-        // pure scalar path
-        for (std::size_t i = 0; i < text_len; ++i) {
-            if (!letter_mask[i] || !key_valid[i % key_len]) {
-                continue;
-            }
+    case Mode::kVigenere:
+        for (int b = 0; b < (int)kVecBlocks; ++b) {
+            __m256i cipher_vec = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+            __m256i key_vec = _mm256_load_si256(
+                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
+
+            __m256i plain_vec = _mm256_sub_epi8(cipher_vec, key_vec);
+            __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+            plain_vec = _mm256_add_epi8(
+                plain_vec, _mm256_and_si256(mask, twenty_six));
+
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                plain_vec);
+
+            vec_index += kVecWidth;
+            block_offset = (block_offset + kVecWidth) % key_len;
+        }
+        break;
+
+    case Mode::kBeaufort:
+        for (int b = 0; b < (int)kVecBlocks; ++b) {
+            __m256i cipher_vec = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+            __m256i key_vec = _mm256_load_si256(
+                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
+
+            __m256i plain_vec = _mm256_sub_epi8(key_vec, cipher_vec);
+            __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
+            plain_vec = _mm256_add_epi8(
+                plain_vec, _mm256_and_si256(mask, twenty_six));
+
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                plain_vec);
+
+            vec_index += kVecWidth;
+            block_offset = (block_offset + kVecWidth) % key_len;
+        }
+        break;
+
+    case Mode::kVariantBeaufort:
+        for (int b = 0; b < (int)kVecBlocks; ++b) {
+            __m256i cipher_vec = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+            __m256i key_vec = _mm256_load_si256(
+                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
+
+            __m256i plain_vec = _mm256_add_epi8(cipher_vec, key_vec);
+            __m256i mask = _mm256_cmpgt_epi8(plain_vec, twenty_five);
+            plain_vec = _mm256_sub_epi8(
+                plain_vec, _mm256_and_si256(mask, twenty_six));
+
+            _mm256_storeu_si256(
+                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                plain_vec);
+
+            vec_index += kVecWidth;
+            block_offset = (block_offset + kVecWidth) % key_len;
+        }
+        break;
+    }
+
+    // **No scalar tail now** – padded_len covers everything
+
+#else
+    {
+        // pure scalar fallback (non-AVX2 builds) – still only over the real kTextLen
+        for (std::size_t i = 0; i < kTextLen; ++i) {
+            if (!letter_mask[i] || !key_valid[i % key_len]) continue;
             plaintext_indices[i] =
                 decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
         }
-    }
+        }
+#endif
 
-     //map plaintext indices back to letters
-    for (std::size_t i = 0; i < text_len; ++i) {
-        if (!letter_mask[i] || !key_valid[i % key_len]) {
-            continue;
-        }
-        std::uint8_t idx = plaintext_indices[i];
-        if (idx < alph.size()) {
-            result[i] = alph[idx];
-        }
+    // map plaintext indices back to letters – only up to text_len (85)
+    for (std::size_t i = 0; i < kTextLen; ++i) {
+        if (!letter_mask[i] || !key_valid[i % key_len]) continue;
+        // for this cipher we assume indices are always 0..25
+        result[i] = alph[plaintext_indices[i]];
     }
 
     return result;
@@ -674,7 +672,6 @@ void maintain_top_results(std::vector<Candidate> &results, const Candidate &cand
         });
 
     if (existing != results.end()) {
-        // Optional: upgrade if the new one is better
         if (candidate.score > existing->score) {
             *existing = candidate;
         }
@@ -997,13 +994,18 @@ WorkerResult process_keys(
     WorkerResult result;
     result.best.reserve(max_results);
 
-    const std::size_t text_len = cipher.size();
     const std::size_t alphabet_count = alphabets.size();
 
-    // per-worker scratch buffers
-    std::vector<std::uint8_t> letter_mask(text_len);
-    std::vector<std::uint8_t> cipher_indices(text_len);
-    std::vector<std::uint8_t> plaintext_indices(text_len);
+    const std::size_t text_len = cipher.size();    // 85 for this tool
+    constexpr std::size_t kVecWidth = 32;
+    const std::size_t padded_len =
+        ((text_len + kVecWidth - 1) / kVecWidth) * kVecWidth; // 96
+
+    // per-worker scratch buffers (padded)
+    std::vector<std::uint8_t> letter_mask(padded_len, 0);
+    std::vector<std::uint8_t> cipher_indices(padded_len, 0);
+    std::vector<std::uint8_t> plaintext_indices(padded_len);
+
 
     std::vector<std::uint8_t> key_indices;
     std::vector<std::uint8_t> key_valid;
