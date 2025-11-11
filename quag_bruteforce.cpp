@@ -1230,6 +1230,12 @@ int main(int argc, char *argv[]) {
   try {
     Options options = parse_options(argc, argv);
 
+#ifdef __AVX2__
+    std::cout << "__AVX2__ is defined\n";
+#else
+    std::cout << "__AVX2__ is NOT defined\n";
+#endif
+
     const std::string cipher = clean_letters(options.ciphertext);
     const std::vector<std::string> key_words = parse_wordlist(options.wordlist);
     if (key_words.empty()) {
