@@ -398,23 +398,6 @@ std::string decrypt_repeating(
 
     std::string result = cipher;
 
-    // build key_indices / key_valid for this (key, alphabet)
-    //key_indices.resize(key_len);
-    //key_valid.resize(key_len);
-    //for (std::size_t i = 0; i < key_len; ++i) {
-    //    int idx = alphabet_index(alphabet, key[i]);
-    //    if (idx < 0) {
-    //        key_valid[i] = 0;
-    //        key_indices[i] = 0;
-    //    }
-    //    else {
-    //        key_indices[i] = static_cast<std::uint8_t>(idx);
-    //        key_valid[i] = 1;
-    //    }
-    //}
-
-    plaintext_indices.resize(text_len);
-
 #if defined(__AVX2__)
     if (text_len >= 32) {
 
@@ -647,7 +630,7 @@ Candidate make_candidate(
   cand.alphabet_base_reversed = alphabet.alphabet_reversed;
   cand.alphabet_keyword_front = alphabet.keyword_front;
   cand.alphabet_string = alphabet.alphabet;
-  cand.first2 = plaintext.substr(0, std::min<std::size_t>(2, plaintext.size()));
+  //cand.first2 = plaintext.substr(0, std::min<std::size_t>(2, plaintext.size()));
   cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
   compute_stats(plaintext, cand.ioc, cand.chi);
 
@@ -660,7 +643,8 @@ Candidate make_candidate(
   const double word_weight = 0.8;
   const double stats_weight = 1.0 - word_weight;
   cand.score = stats_score;
-  if (cand.ioc > .05 && cand.chi < 160 && spacing_pattern && spacing_words_by_length) {
+  if (cand.ioc > .05 && cand.chi < 160 && spacing_pattern && spacing_words_by_length) 
+  {
     auto result = count_spacing_matches(plaintext, *spacing_pattern,
                                         *spacing_words_by_length);
     cand.spacing_matches = result.first;
@@ -1072,17 +1056,7 @@ WorkerResult process_keys(
                 }
             }
 
-#if defined(__AVX2__)
-            // build per-decrypt key_blocks, but reuse the vector
-            const size_t key_len = key_word.size();
-            key_blocks.resize(key_len);
-            for (std::size_t start = 0; start < key_len; ++start) {
-                auto& block = key_blocks[start];
-                for (std::size_t j = 0; j < block.data.size(); ++j) {
-                    block.data[j] = key_indices[(start + j) % key_len];
-                }
-            }
-#endif
+            bool keyblockBuilt = false;
 
             for (Mode mode : modes) 
             {
@@ -1103,6 +1077,23 @@ WorkerResult process_keys(
                 {
                     continue; // reject this (key, alphabet, mode) without full decrypt
                 }
+
+#if defined(__AVX2__)
+
+                if (!keyblockBuilt)
+                {
+                    // build per-decrypt key_blocks, but reuse the vector
+                    const size_t key_len = key_word.size();
+                    key_blocks.resize(key_len);
+                    for (std::size_t start = 0; start < key_len; ++start) {
+                        auto& block = key_blocks[start];
+                        for (std::size_t j = 0; j < block.data.size(); ++j) {
+                            block.data[j] = key_indices[(start + j) % key_len];
+                        }
+                    }
+                    keyblockBuilt = true;
+                }
+#endif
 
                 std::string plaintext =
                     decrypt_repeating(cipher, key_word, alphabet, mode,
@@ -1126,29 +1117,6 @@ WorkerResult process_keys(
                     ++result.autokey_attempts;
                     ++autokey_counter;
 
-                    if (plaintext_auto.size() < 2) {
-                        continue;
-                    }
-                    std::string first2_auto =
-                        plaintext_auto.substr(0, 2);
-                    bool apply_second4_auto =
-                        have_second4_filter &&
-                        plaintext_auto.size() >= 6;
-                    std::string second4_auto =
-                        apply_second4_auto
-                        ? plaintext_auto.substr(2, 4)
-                        : std::string();
-                    if (have_first2_filter &&
-                        two_letter_set.find(first2_auto) ==
-                        two_letter_set.end()) {
-                        continue;
-                    }
-                    if (apply_second4_auto &&
-                        four_letter_set.find(second4_auto) ==
-                        four_letter_set.end()) {
-                        continue;
-                    }
-
                     Candidate cand_auto = make_candidate(
                         key_word, alphabet, mode, true,
                         plaintext_auto, preview_length,
@@ -1164,8 +1132,8 @@ WorkerResult process_keys(
         ++result.keys_processed;
         ++keys_counter;
 
-        // merge local best into global (you can make this periodic later)
-        if (a % 50 == 0)
+        //merge local best into global (you can make this periodic later)
+        if (a % 1000 == 0)
         {
             std::lock_guard<std::mutex> lock(results_mutex);
             for (const auto& cand : result.best) {
