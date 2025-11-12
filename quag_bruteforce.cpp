@@ -90,6 +90,7 @@ struct Options {
   bool include_autokey = false;
   double progress_interval_seconds = 1.0;
   bool quiet = false;
+  bool use_cuda = false;
   bool include_keyword_front = true;
   bool include_reversed_keyword_front = true;
   bool include_keyword_back = true;
@@ -825,6 +826,10 @@ Options parse_options(int argc, char *argv[]) {
       options.progress_interval_seconds = std::stod(require_value(arg));
     } else if (arg == "--quiet") {
       options.quiet = true;
+    } else if (arg == "--use-cuda") {
+      options.use_cuda = true;
+    } else if (arg == "--no-cuda") {
+      options.use_cuda = false;
     } else if (arg == "--no-keyword-front") {
       options.include_keyword_front = false;
     } else if (arg == "--no-reversed-keyword-front") {
@@ -854,6 +859,8 @@ Options parse_options(int argc, char *argv[]) {
                 << "  --preview-length <N>            Plaintext preview length (default 80)\n"
                 << "  --threads <N>                   Worker threads (default hardware)\n"
                 << "  --include-autokey               Try autokey variants too\n"
+                << "  --use-cuda                      Enable experimental CUDA execution\n"
+                << "  --no-cuda                       Force CPU execution (default)\n"
                 << "  --progress-interval <sec>       Progress update interval (default 1.0)\n"
                 << "  --quiet                         Suppress periodic progress output\n"
                 << "  --no-keyword-front              Skip key prefix on normal alphabet\n"
@@ -1091,7 +1098,8 @@ WorkerResult process_keys(
     const std::vector<int>* spacing_pattern,
     const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
     std::size_t max_results, std::size_t preview_length,
-    bool include_autokey, std::atomic<std::size_t>& combos_counter,
+    bool include_autokey, bool use_cuda,
+    std::atomic<std::size_t>& combos_counter,
     std::atomic<std::size_t>& autokey_counter,
     std::atomic<std::size_t>& keys_counter,
     std::mutex& results_mutex,
@@ -1099,6 +1107,8 @@ WorkerResult process_keys(
 {
     WorkerResult result;
     result.best.reserve(max_results);
+
+    (void)use_cuda;
 
     const std::size_t alphabet_count = alphabets.size();
 
@@ -1469,6 +1479,8 @@ int main(int argc, char *argv[]) {
       std::cout << "Autokey variants enabled" << '\n';
     }
     std::cout << "Using " << options.threads << " worker threads" << '\n' << std::endl;
+    std::cout << "CUDA execution: " << (options.use_cuda ? "enabled" : "disabled")
+              << '\n';
 
     std::atomic<std::size_t> combos_counter{0};
     std::atomic<std::size_t> autokey_counter{0};
@@ -1520,6 +1532,7 @@ int main(int argc, char *argv[]) {
             four_letter_set, have_first2_filter, have_second4_filter,
             spacing_pattern_ptr, spacing_words_ptr,
             results_limit, options.preview_length, options.include_autokey,
+            options.use_cuda,
             combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
         std::lock_guard<std::mutex> lock(results_mutex);
         for (const auto &cand : worker_result.best) {
