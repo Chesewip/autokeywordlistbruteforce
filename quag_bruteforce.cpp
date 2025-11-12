@@ -705,41 +705,42 @@ Candidate make_candidate(
     double chi2) 
 {
 
-  Candidate cand;
-  cand.key = key_word;
-  cand.mode = mode;
-  cand.autokey = autokey_variant;
-  cand.alphabet_word = alphabet.base_word;
-  cand.alphabet_keyword_reversed = alphabet.keyword_reversed;
-  cand.alphabet_base_reversed = alphabet.alphabet_reversed;
-  cand.alphabet_keyword_front = alphabet.keyword_front;
-  cand.alphabet_string = alphabet.alphabet;
-  cand.ioc = ioc;
-  cand.chi = chi2;
-  cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
+    Candidate cand;
+    cand.key = key_word;
+    cand.mode = mode;
+    cand.autokey = autokey_variant;
+    cand.alphabet_word = alphabet.base_word;
+    cand.alphabet_keyword_reversed = alphabet.keyword_reversed;
+    cand.alphabet_base_reversed = alphabet.alphabet_reversed;
+    cand.alphabet_keyword_front = alphabet.keyword_front;
+    cand.alphabet_string = alphabet.alphabet;
+    cand.ioc = ioc;
+    cand.chi = chi2;
+    cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
 
-  const double ioc_delta = std::abs(cand.ioc - kIocTarget);
-  const double ioc_score = std::max(0.0, 1.0 - ioc_delta / 0.02);
-  const double chi_clamped = std::min(400.0, cand.chi);
-  const double chi_score = std::max(0.0, 1.0 - chi_clamped / 400.0);
-  const double quality_factor = 0.1 + 0.9 * chi_score;
-  const double stats_score = ioc_score * quality_factor;
-  const double word_weight = 0.8;
-  const double stats_weight = 1.0 - word_weight;
-  cand.score = stats_score;
-  if (cand.ioc > .05 && cand.chi < 160 && spacing_pattern && spacing_words_by_length) 
-  {
+    const double ioc_delta = std::abs(cand.ioc - kIocTarget);
+    const double ioc_score = std::max(0.0, 1.0 - ioc_delta / 0.02);
+    const double chi_clamped = std::min(400.0, cand.chi);
+    const double chi_score = std::max(0.0, 1.0 - chi_clamped / 400.0);
+    const double quality_factor = 0.1 + 0.9 * chi_score;
+    const double stats_score = ioc_score * quality_factor;
+    const double word_weight = 0.8;
+    const double stats_weight = 1.0 - word_weight;
+    cand.score = stats_score;
+
     auto result = count_spacing_matches(plaintext, *spacing_pattern,
                                         *spacing_words_by_length);
     cand.spacing_matches = result.first;
     cand.spacing_total = result.second;
-    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) {
-      double word_score = static_cast<double>(cand.spacing_matches) /
-                          static_cast<double>(cand.spacing_total);
-      cand.score = word_weight * word_score + stats_weight * stats_score;
+
+    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) 
+    {
+        double word_score = static_cast<double>(cand.spacing_matches) /
+                            static_cast<double>(cand.spacing_total);
+        cand.score = word_weight * word_score + stats_weight * stats_score;
     }
-  }
-  return cand;
+
+    return cand;
 }
 
 
