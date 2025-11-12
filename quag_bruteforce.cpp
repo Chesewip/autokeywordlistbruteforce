@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -137,7 +138,7 @@ inline std::uint16_t encode_bigram(char a, char b) {
 }
 
 inline std::uint32_t encode_quad(char a, char b, char c, char d) {
-    // assume A–Z; caller should validate if needed
+    // assume A-Z; caller should validate if needed
     int ia = a - 'A';
     int ib = b - 'A';
     int ic = c - 'A';
@@ -161,7 +162,7 @@ std::unordered_set<std::uint16_t> parse_two_letter_list(const std::string& text)
             char a = cleaned[0];
             char b = cleaned[1];
 
-            // Optional: be defensive, skip non A–Z
+            // Optional: be defensive, skip non A-Z
             if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') {
                 continue;
             }
@@ -325,7 +326,7 @@ bool same_candidate_identity(const Candidate& a, const Candidate& b)
 }
 
 std::string build_plaintext_string(const AlphabetCandidate& alphabet,
-    const std::vector<std::uint8_t>& plaintext_indices,
+    const std::uint8_t* plaintext_indices,
     std::size_t text_len)
 {
     std::string result;
@@ -436,31 +437,29 @@ inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
 }
 
 void decrypt_repeating(
-    const std::string& cipher, const std::string& key,
-    const AlphabetCandidate& alphabet, Mode mode,
-    const std::vector<std::uint8_t>& cipher_indices,   // precomputed per alphabet
-    const std::vector<std::uint8_t>& letter_mask,      // precomputed once per worker
-    std::vector<std::uint8_t>& key_indices,            // scratch per key
-    std::vector<std::uint8_t>& key_valid,              // scratch per key
-    std::vector<std::uint8_t>& plaintext_indices       // scratch per decrypt
+    const AlphabetCandidate& alphabet,
+    Mode mode,
+    const std::uint8_t* cipher_indices,
+    const std::uint8_t* letter_mask,
+    const std::uint8_t* key_indices,
+    const std::uint8_t* key_valid,
+    std::size_t key_len,
+    std::uint8_t* plaintext_indices,
+    std::size_t text_len,
+    std::size_t padded_len
 #if defined(__AVX2__)
-    , std::vector<KeyBlock>& key_blocks                // scratch per decrypt (AVX2)
+    , const KeyBlock* key_blocks
 #endif
 )
 {
-
-    const std::size_t key_len = key.size();
-    const std::string& alph = alphabet.alphabet;
-
-    // For this tool we *know* text_len == 85
-    constexpr std::size_t kTextLen = 85;
-    constexpr std::size_t kVecWidth = 32;
-    constexpr std::size_t kPaddedLen = ((kTextLen + kVecWidth - 1) / kVecWidth) * kVecWidth; // 96
-    constexpr std::size_t kVecBlocks = kPaddedLen / kVecWidth; // 3
-
-    std::string result = cipher;
+    (void)alphabet;
+    if (padded_len == 0 || key_len == 0 || plaintext_indices == nullptr) {
+        return;
+    }
 
 #if defined(__AVX2__)
+    constexpr std::size_t kVecWidth = 32;
+    const std::size_t vec_blocks = padded_len / kVecWidth;
 
     const __m256i zero = _mm256_setzero_si256();
     const __m256i twenty_six = _mm256_set1_epi8(26);
@@ -472,9 +471,9 @@ void decrypt_repeating(
     switch (mode)
     {
     case Mode::kVigenere:
-        for (int b = 0; b < (int)kVecBlocks; ++b) {
+        for (std::size_t b = 0; b < vec_blocks; ++b) {
             __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
             __m256i key_vec = _mm256_load_si256(
                 reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
 
@@ -484,7 +483,7 @@ void decrypt_repeating(
                 plain_vec, _mm256_and_si256(mask, twenty_six));
 
             _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
                 plain_vec);
 
             vec_index += kVecWidth;
@@ -493,9 +492,9 @@ void decrypt_repeating(
         break;
 
     case Mode::kBeaufort:
-        for (int b = 0; b < (int)kVecBlocks; ++b) {
+        for (std::size_t b = 0; b < vec_blocks; ++b) {
             __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
             __m256i key_vec = _mm256_load_si256(
                 reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
 
@@ -505,7 +504,7 @@ void decrypt_repeating(
                 plain_vec, _mm256_and_si256(mask, twenty_six));
 
             _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
                 plain_vec);
 
             vec_index += kVecWidth;
@@ -514,9 +513,9 @@ void decrypt_repeating(
         break;
 
     case Mode::kVariantBeaufort:
-        for (int b = 0; b < (int)kVecBlocks; ++b) {
+        for (std::size_t b = 0; b < vec_blocks; ++b) {
             __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices.data() + vec_index));
+                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
             __m256i key_vec = _mm256_load_si256(
                 reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
 
@@ -526,7 +525,7 @@ void decrypt_repeating(
                 plain_vec, _mm256_and_si256(mask, twenty_six));
 
             _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices.data() + vec_index),
+                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
                 plain_vec);
 
             vec_index += kVecWidth;
@@ -534,66 +533,47 @@ void decrypt_repeating(
         }
         break;
     }
-
-    // **No scalar tail now** – padded_len covers everything
-
 #else
-    {
-        // pure scalar fallback (non-AVX2 builds) – still only over the real kTextLen
-        for (std::size_t i = 0; i < kTextLen; ++i) {
-            if (!letter_mask[i] || !key_valid[i % key_len]) continue;
-            plaintext_indices[i] =
-                decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    for (std::size_t i = 0; i < text_len; ++i) {
+        if (!letter_mask[i] || !key_valid[i % key_len]) {
+            plaintext_indices[i] = 0;
+            continue;
         }
-        }
+        plaintext_indices[i] =
+            decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
+    }
 #endif
 
-    /*
-    // map plaintext indices back to letters – only up to text_len (85)
-    for (std::size_t i = 0; i < kTextLen; ++i) {
-        if (!letter_mask[i] || !key_valid[i % key_len]) continue;
-        // for this cipher we assume indices are always 0..25
-        result[i] = alph[plaintext_indices[i]];
+    for (std::size_t i = 0; i < text_len; ++i) {
+        if (!letter_mask[i] || !key_valid[i % key_len]) {
+            plaintext_indices[i] = 0;
+        }
     }
-
-    return result;
-    */
+    for (std::size_t i = text_len; i < padded_len; ++i) {
+        plaintext_indices[i] = 0;
+    }
 }
 
-
 void decrypt_autokey(
-    const std::vector<std::uint8_t>& cipher_indices,  // size = text_len
-    const std::vector<std::uint8_t>& key_indices,     // size = key_len
-    std::vector<std::uint8_t>& plaintext_indices,     // scratch out
+    const std::uint8_t* cipher_indices,
+    std::size_t cipher_len,
+    const std::uint8_t* key_indices,
+    std::size_t key_len,
+    std::uint8_t* plaintext_indices,
     Mode mode)
 {
-    const std::size_t n = cipher_indices.size();
-    const std::size_t key_len = key_indices.size();
-
-    if (n == 0 || key_len == 0) {
-        plaintext_indices.clear();
+    if (cipher_len == 0 || key_len == 0 || plaintext_indices == nullptr) {
         return;
     }
 
-    plaintext_indices.resize(n);
-
-    for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t i = 0; i < cipher_len; ++i) {
         std::uint8_t c_idx = cipher_indices[i];
-        std::uint8_t k_idx;
-
-        if (i < key_len) {
-            // normal key period
-            k_idx = key_indices[i];
-        }
-        else {
-            // autokey: use previous plaintext symbol
-            k_idx = plaintext_indices[i - key_len];
-        }
-
+        std::uint8_t k_idx = (i < key_len)
+            ? key_indices[i]
+            : plaintext_indices[i - key_len];
         plaintext_indices[i] = decrypt_symbol(c_idx, k_idx, mode);
     }
 }
-
 
 double index_of_coincidence(const std::string &text) {
   const std::size_t n = text.size();
@@ -1128,20 +1108,40 @@ WorkerResult process_keys(
         ((text_len + kVecWidth - 1) / kVecWidth) * kVecWidth; // 96
 
     // per-worker scratch buffers (padded)
-    std::vector<std::uint8_t> letter_mask(padded_len, 0);
-    std::vector<std::uint8_t> cipher_indices(padded_len, 0);
-    std::vector<std::uint8_t> plaintext_indices(padded_len);
+    std::unique_ptr<std::uint8_t[]> letter_mask(new std::uint8_t[padded_len]());
+    std::unique_ptr<std::uint8_t[]> cipher_indices(new std::uint8_t[padded_len]());
+    std::unique_ptr<std::uint8_t[]> plaintext_indices(new std::uint8_t[padded_len]());
 
-
-    std::vector<std::uint8_t> key_indices;
-    std::vector<std::uint8_t> key_valid;
-    key_indices.reserve(64);
-    key_valid.reserve(64);
+    std::unique_ptr<std::uint8_t[]> key_indices;
+    std::size_t key_indices_capacity = 0;
+    std::unique_ptr<std::uint8_t[]> key_valid;
+    std::size_t key_valid_capacity = 0;
 #if defined(__AVX2__)
-    std::vector<KeyBlock> key_blocks;
+    std::unique_ptr<KeyBlock[]> key_blocks;
+    std::size_t key_block_capacity = 0;
+#endif
+    std::unique_ptr<std::uint8_t[]> autokey_plaintext;
+    std::size_t autokey_capacity = 0;
+
+    auto ensure_u8_capacity = [](std::unique_ptr<std::uint8_t[]>& buffer, std::size_t& capacity, std::size_t required) {
+        if (capacity < required) {
+            std::unique_ptr<std::uint8_t[]> new_buffer(new std::uint8_t[required]);
+            buffer.swap(new_buffer);
+            capacity = required;
+        }
+    };
+#if defined(__AVX2__)
+    auto ensure_keyblock_capacity = [](std::unique_ptr<KeyBlock[]>& buffer, std::size_t& capacity, std::size_t required) {
+        if (capacity < required) {
+            std::unique_ptr<KeyBlock[]> new_buffer(new KeyBlock[required]);
+            buffer.swap(new_buffer);
+            capacity = required;
+        }
+    };
 #endif
 
-    // build letter_mask once (A–Z only)
+    // build letter_mask once (A-Z only)
+    std::fill(letter_mask.get(), letter_mask.get() + padded_len, 0);
     for (std::size_t i = 0; i < text_len; ++i) {
         char c = cipher[i];
         letter_mask[i] = (c >= 'A' && c <= 'Z') ? 1u : 0u;
@@ -1162,6 +1162,7 @@ WorkerResult process_keys(
                 ? static_cast<std::uint8_t>(idx)
                 : 0;
         }
+        std::fill(cipher_indices.get() + text_len, cipher_indices.get() + padded_len, 0);
 
         //std::unordered_map<Mode, std::unordered_set<std::string>> trashBigramMap;
         std::unordered_map<Mode, std::unordered_set<std::uint16_t>> trashBigramMap;
@@ -1171,9 +1172,10 @@ WorkerResult process_keys(
             const std::string& key_word = keys[idx];
 
 
-            key_indices.resize(key_word.size());
-            key_valid.resize(key_word.size());
-            for (std::size_t i = 0; i < key_word.size(); ++i) 
+            const std::size_t key_len = key_word.size();
+            ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
+            ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
+            for (std::size_t i = 0; i < key_len; ++i)
             {
                 int idx = alphabet_index(alphabet, key_word[i]);
                 if (idx < 0) {
@@ -1186,8 +1188,12 @@ WorkerResult process_keys(
                 }
             }
 
+            if (key_len == 0) {
+                continue;
+            }
+
             std::uint16_t key_bigram_code = 0;
-            bool has_bigram = key_word.size() >= 2;
+            bool has_bigram = key_len >= 2;
             if (has_bigram) {
                 char a = key_word[0];
                 char b = key_word[1];
@@ -1227,9 +1233,7 @@ WorkerResult process_keys(
 
                 if (!keyblockBuilt)
                 {
-                    // build per-decrypt key_blocks, but reuse the vector
-                    const size_t key_len = key_word.size();
-                    key_blocks.resize(key_len);
+                    ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
                     for (std::size_t start = 0; start < key_len; ++start) {
                         auto& block = key_blocks[start];
                         for (std::size_t j = 0; j < block.data.size(); ++j) {
@@ -1240,23 +1244,30 @@ WorkerResult process_keys(
                 }
 #endif
 
-                    decrypt_repeating(cipher, key_word, alphabet, mode,
-                        cipher_indices, letter_mask,
-                        key_indices, key_valid,
-                        plaintext_indices
+                    decrypt_repeating(
+                        alphabet,
+                        mode,
+                        cipher_indices.get(),
+                        letter_mask.get(),
+                        key_indices.get(),
+                        key_valid.get(),
+                        key_len,
+                        plaintext_indices.get(),
+                        text_len,
+                        padded_len
 #if defined(__AVX2__)
-                        , key_blocks
+                        , key_blocks.get()
 #endif
                     );
 
                 double ioc, chi;
-                compute_stats_indices(plaintext_indices.data(), text_len, alphabet, ioc, chi);
+                compute_stats_indices(plaintext_indices.get(), text_len, alphabet, ioc, chi);
 
                 // coarse gate: only pay for full string+spacing for promising stats
                 // tune these thresholds as you like
                 if (ioc > 0.05 && chi < 160.0) 
                 {
-                    std::string plaintext = build_plaintext_string(alphabet, plaintext_indices, text_len);
+                    std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
 
                     Candidate cand = make_candidate(
                         key_word, alphabet, mode, false,
@@ -1266,36 +1277,34 @@ WorkerResult process_keys(
                 }
 
 
-                if (include_autokey) 
+                if (include_autokey)
                  {
                     ++result.autokey_attempts;
                     ++autokey_counter;
 
-                    // reuse the same cipher_indices and key_indices we already built
-                    std::vector<std::uint8_t> plaintext_indices_autokey; // or reuse the same scratch
+                    ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
 
                     decrypt_autokey(
-                        cipher_indices,
-                        key_indices,
-                        plaintext_indices_autokey,
+                        cipher_indices.get(),
+                        text_len,
+                        key_indices.get(),
+                        key_len,
+                        autokey_plaintext.get(),
                         mode);
 
                     double ioc_auto = 0.0, chi_auto = 0.0;
-                    const std::size_t text_len = cipher.size(); // 85 for your Quag 3
 
                     compute_stats_indices(
-                        plaintext_indices_autokey.data(),
+                        autokey_plaintext.get(),
                         text_len,
                         alphabet,
                         ioc_auto,
                         chi_auto);
 
-                    // cheap “quality gate” on stats before we pay for string/spacer work
-                    if (ioc_auto > 0.05 && chi_auto < 160.0) 
+                    if (ioc_auto > 0.05 && chi_auto < 160.0)
                     {
-                        // map indices letters only for promising candidates
                         std::string plaintext_auto =
-                            build_plaintext_string(alphabet, plaintext_indices_autokey, text_len);
+                            build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
 
                         Candidate cand_auto = make_candidate(
                             key_word,
@@ -1311,6 +1320,7 @@ WorkerResult process_keys(
 
                         maintain_top_results(result.best, cand_auto, max_results);
                     }
+
                 }
             }
 
