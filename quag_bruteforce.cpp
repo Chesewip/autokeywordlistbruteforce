@@ -736,7 +736,6 @@ Candidate make_candidate(
   cand.ioc = ioc;
   cand.chi = chi2;
   cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
-  compute_stats(plaintext, cand.ioc, cand.chi);
 
   const double ioc_delta = std::abs(cand.ioc - kIocTarget);
   const double ioc_score = std::max(0.0, 1.0 - ioc_delta / 0.02);
