@@ -24,6 +24,27 @@ cl /std:c++17 /O2 /EHsc /arch:AVX2 /Fe:quag_bruteforce_cpp.exe quag_bruteforce.c
 
 ```
 
+
+### CUDA build (optional)
+
+To enable the GPU accelerated scoring path, compile the CUDA translation unit and link it with the main executable. Example commands on Linux:
+
+```bash
+nvcc -std=c++17 -O3 -c gpu_quag.cu -o gpu_quag.o
+g++ -std=c++17 -O3 -mavx2 -mfma -pthread quag_bruteforce.cpp gpu_quag.o -lcudart -L"${CUDA_HOME:-/usr/local/cuda}/lib64" -o quag_bruteforce_cpp
+```
+
+On Windows with the Visual Studio toolchain:
+
+```cmd
+nvcc -std=c++17 -O3 -c gpu_quag.cu -o gpu_quag.obj
+cl /std:c++17 /O2 /EHsc /arch:AVX2 quag_bruteforce.cpp gpu_quag.obj /link cudart.lib
+```
+
+At runtime pass `--use-cuda` to request GPU execution. The solver automatically falls back to the CPU path when no CUDA device is available.
+
+To confirm parity between the CPU and GPU implementations, run a sample search with `--use-cuda` and then with `--no-cuda`, and compare the ranked results.
+
 ### Usage
 
 Something like this. Ended up having a lot of word lists options that need to be set. 
