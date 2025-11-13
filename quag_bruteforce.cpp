@@ -22,6 +22,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "gpu_quag.h"
+#include <numeric>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -90,7 +92,7 @@ struct Options {
   bool include_autokey = false;
   double progress_interval_seconds = 1.0;
   bool quiet = false;
-  bool use_cuda = false;
+  bool use_cuda = true;
   bool include_keyword_front = true;
   bool include_reversed_keyword_front = true;
   bool include_keyword_back = true;
@@ -545,14 +547,6 @@ void decrypt_repeating(
     }
 #endif
 
-    for (std::size_t i = 0; i < text_len; ++i) {
-        if (!letter_mask[i] || !key_valid[i % key_len]) {
-            plaintext_indices[i] = 0;
-        }
-    }
-    for (std::size_t i = text_len; i < padded_len; ++i) {
-        plaintext_indices[i] = 0;
-    }
 }
 
 void decrypt_autokey(
@@ -574,47 +568,6 @@ void decrypt_autokey(
             : plaintext_indices[i - key_len];
         plaintext_indices[i] = decrypt_symbol(c_idx, k_idx, mode);
     }
-}
-
-double index_of_coincidence(const std::string &text) {
-  const std::size_t n = text.size();
-  if (n <= 1) {
-    return 0.0;
-  }
-  std::array<std::size_t, 26> counts{};
-  for (char ch : text) {
-    if (ch >= 'A' && ch <= 'Z') {
-      counts[ch - 'A']++;
-    }
-  }
-  double numerator = 0.0;
-  for (std::size_t count : counts) {
-    numerator += static_cast<double>(count) * static_cast<double>(count - 1);
-  }
-  return numerator / (static_cast<double>(n) * static_cast<double>(n - 1));
-}
-
-double chi_square(const std::string &text) {
-  const std::size_t n = text.size();
-  if (n == 0) {
-    return std::numeric_limits<double>::infinity();
-  }
-  std::array<std::size_t, 26> counts{};
-  for (char ch : text) {
-    if (ch >= 'A' && ch <= 'Z') {
-      counts[ch - 'A']++;
-    }
-  }
-  double chi = 0.0;
-  for (std::size_t i = 0; i < 26; ++i) {
-    double expected = static_cast<double>(n) * kEnglishFreq[i];
-    if (expected <= 0.0) {
-      continue;
-    }
-    double diff = static_cast<double>(counts[i]) - expected;
-    chi += (diff * diff) / expected;
-  }
-  return chi;
 }
 
 void compute_stats_indices(const std::uint8_t* plain,
@@ -658,39 +611,6 @@ void compute_stats_indices(const std::uint8_t* plain,
 
     out_ioc = numerator / (static_cast<double>(n) * static_cast<double>(n - 1));
     out_chi = chi;
-}
-
-
-void compute_stats(const std::string& text, double& out_ioc, double& out_chi) {
-    const std::size_t n = text.size();
-    if (n <= 1) {
-        out_ioc = 0.0;
-        out_chi = std::numeric_limits<double>::infinity();
-        return;
-    }
-
-    std::array<std::size_t, 26> counts{};
-    for (char ch : text) {
-        if (ch >= 'A' && ch <= 'Z') {
-            counts[ch - 'A']++;
-        }
-    }
-
-    double numerator = 0.0;
-    double chi = 0.0;
-    for (std::size_t i = 0; i < 26; ++i) {
-        std::size_t c = counts[i];
-        numerator += static_cast<double>(c) * static_cast<double>(c - 1);
-
-        double expected = static_cast<double>(n) * kEnglishFreq[i];
-        if (expected > 0.0) {
-            double diff = static_cast<double>(c) - expected;
-            chi += (diff * diff) / expected;
-        }
-    }
-
-    out_ioc = numerator / (static_cast<double>(n) * static_cast<double>(n - 1));
-    out_chi = (n == 0 ? std::numeric_limits<double>::infinity() : chi);
 }
 
 Candidate make_candidate(
@@ -1109,14 +1029,11 @@ WorkerResult process_keys(
     WorkerResult result;
     result.best.reserve(max_results);
 
-    (void)use_cuda;
-
     const std::size_t alphabet_count = alphabets.size();
-
-    const std::size_t text_len = cipher.size();    // 85 for this tool
+    const std::size_t text_len = cipher.size();    // e.g. 85
     constexpr std::size_t kVecWidth = 32;
     const std::size_t padded_len =
-        ((text_len + kVecWidth - 1) / kVecWidth) * kVecWidth; // 96
+        ((text_len + kVecWidth - 1) / kVecWidth) * kVecWidth; // e.g. 96
 
     // per-worker scratch buffers (padded)
     std::unique_ptr<std::uint8_t[]> letter_mask(new std::uint8_t[padded_len]());
@@ -1158,101 +1075,363 @@ WorkerResult process_keys(
         letter_mask[i] = (c >= 'A' && c <= 'Z') ? 1u : 0u;
     }
 
-    // Outer: alphabets
-    for (std::size_t a = 0; a < alphabet_count; ++a) {
-        const auto& alphabet = alphabets[a];
+    // ---- GPU MEGA-BATCH PATH ----
+    if (use_cuda)
+    {
+        // device gates
+        constexpr float IOC_GATE = 0.052f;
+        constexpr float CHI_GATE = 100.0f;
 
-        // build cipher_indices for this alphabet once
-        for (std::size_t i = 0; i < text_len; ++i) {
-            if (!letter_mask[i]) {
-                cipher_indices[i] = 0;
-                continue;
-            }
-            int idx = alphabet_index(alphabet, cipher[i]);
-            cipher_indices[i] = (idx >= 0)
-                ? static_cast<std::uint8_t>(idx)
-                : 0;
+        // Upload 2-gram / 4-gram filters once per worker
+        {
+            std::vector<std::uint16_t> bigram_codes;
+            bigram_codes.reserve(two_letter_set.size());
+            for (auto v : two_letter_set) bigram_codes.push_back(v);
+
+            std::vector<std::uint32_t> quad_codes;
+            quad_codes.reserve(four_letter_set.size());
+            for (auto v : four_letter_set) quad_codes.push_back(v);
+
+            std::vector<std::uint32_t> two_bits, four_bits;
+            build_bigram_bitset(bigram_codes, two_bits);
+            build_quadgram_bitset(quad_codes, four_bits);
+            gpu_upload_gram_bitsets(two_bits, four_bits);
         }
-        std::fill(cipher_indices.get() + text_len, cipher_indices.get() + padded_len, 0);
 
-        //std::unordered_map<Mode, std::unordered_set<std::string>> trashBigramMap;
-        std::unordered_map<Mode, std::unordered_set<std::uint16_t>> trashBigramMap;
+        // Slice of keys for this worker [begin,end)
+        std::vector<std::string> keys_slice;
+        keys_slice.reserve(end - begin);
+        for (std::size_t i = begin; i < end; ++i) keys_slice.push_back(keys[i]);
 
-        // Inner: keys assigned to this worker
-        for (std::size_t idx = begin; idx < end; ++idx) {
-            const std::string& key_word = keys[idx];
+        // Pack keys ONCE as letters (device will map via index_map per alphabet)
+        PackedKeysHostLetters packed_letters;
+        {
+            packed_letters.key_offsets.resize(keys_slice.size());
+            packed_letters.key_lengths.resize(keys_slice.size());
+            packed_letters.key_chars_flat.reserve(
+                std::accumulate(keys_slice.begin(), keys_slice.end(), std::size_t(0),
+                    [](std::size_t s, const std::string& k) { return s + k.size(); }));
 
-
-            const std::size_t key_len = key_word.size();
-            ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
-            ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
-            for (std::size_t i = 0; i < key_len; ++i)
-            {
-                int idx = alphabet_index(alphabet, key_word[i]);
-                if (idx < 0) {
-                    key_valid[i] = 0;
-                    key_indices[i] = 0;
+            std::size_t off = 0;
+            for (std::size_t i = 0; i < keys_slice.size(); ++i) {
+                packed_letters.key_offsets[i] = static_cast<std::uint32_t>(off);
+                packed_letters.key_lengths[i] = static_cast<std::uint16_t>(keys_slice[i].size());
+                for (char ch : keys_slice[i]) {
+                    // assume already cleaned/uppercased
+                    packed_letters.key_chars_flat.push_back(static_cast<std::uint8_t>(ch));
                 }
-                else {
-                    key_valid[i] = 1;
-                    key_indices[i] = static_cast<std::uint8_t>(idx);
+                off += keys_slice[i].size();
+            }
+        }
+
+        // Mega-batch alphabets per launch (tune). Aim to keep the GPU busy.
+        constexpr std::size_t A_BATCH = 4096; // try 2k–8k depending on VRAM
+
+        // Process alphabets in chunks of A_BATCH (each with 3 modes per alphabet)
+        for (std::size_t a0 = 0; a0 < alphabet_count; a0 += A_BATCH)
+        {
+            const std::size_t a1 = std::min(a0 + A_BATCH, alphabet_count);
+            const std::size_t batch_alphas = a1 - a0;
+
+            // Build all tiles for this mega-batch
+            std::vector<DeviceAlphabetTile> tiles;
+            tiles.reserve(batch_alphas * 3);
+
+            for (std::size_t a = a0; a < a1; ++a) {
+                const auto& alphabet = alphabets[a];
+
+                DeviceAlphabetTile base{};
+                // cipher_idx/mask per alphabet
+                for (std::size_t i = 0; i < text_len; ++i) {
+                    if (!letter_mask[i]) {
+                        base.cipher_idx[i] = 0;
+                        base.mask[i] = 0;
+                    }
+                    else {
+                        int idx = alphabet_index(alphabet, cipher[i]);
+                        base.cipher_idx[i] = (idx >= 0) ? static_cast<std::uint8_t>(idx) : 0;
+                        base.mask[i] = 1;
+                    }
+                }
+                // pad to 96
+                for (std::size_t i = text_len; i < padded_len; ++i) {
+                    base.cipher_idx[i] = 0; base.mask[i] = 0;
+                }
+                // keyed alphabet + index map
+                for (int j = 0; j < 26; ++j) {
+                    base.alph[j] = alphabet.alphabet[j];
+                    base.index_map[j] = static_cast<std::int8_t>(alphabet.index_map[j]); // -1 if absent
+                }
+                base.text_len = static_cast<int>(text_len);
+                base.alphabet_id = static_cast<std::uint32_t>(a);
+
+                // three modes
+                for (int m = 0; m < 3; ++m) {
+                    DeviceAlphabetTile t = base;
+                    t.mode = static_cast<std::uint8_t>(m);
+                    tiles.push_back(t);
                 }
             }
 
-            if (key_len == 0) {
-                continue;
-            }
+            // progress accounting (approximate): all key×mode within this batch
+            const std::size_t combos_for_batch = (end - begin) * 3 * batch_alphas;
+            result.combos += combos_for_batch;
+            combos_counter += combos_for_batch;
 
-            std::uint16_t key_bigram_code = 0;
-            bool has_bigram = key_len >= 2;
-            if (has_bigram) {
-                char a = key_word[0];
-                char b = key_word[1];
-                // assume already uppercase
-                key_bigram_code = encode_bigram(a, b);
-            }
+            // choose caps (heuristic). You can make these CLI knobs.
+            const std::size_t max_full_hits = std::max<std::size_t>(packed_letters.num_keys() * tiles.size() / 1000, 8192);
+            const std::size_t max_front_hits = std::max<std::size_t>(packed_letters.num_keys() * tiles.size() / 500, 16384);
 
-            bool keyblockBuilt = false;
+            // one big launch for this batch
+            GpuBatchResult gres = launch_q3_gpu_megabatch(tiles, packed_letters, IOC_GATE, CHI_GATE,
+                max_full_hits, max_front_hits);
 
-            for (Mode mode : modes) 
+            // For post-processing we’ll fetch the alphabet by absolute id per hit.
+            // We rebuild cipher_indices for that alphabet (tiny cost, 96B).
+            auto rebuild_cipher_indices = [&](const AlphabetCandidate& alphabet) {
+                for (std::size_t i = 0; i < text_len; ++i) {
+                    if (!letter_mask[i]) { cipher_indices[i] = 0; continue; }
+                    int idx = alphabet_index(alphabet, cipher[i]);
+                    cipher_indices[i] = (idx >= 0) ? static_cast<std::uint8_t>(idx) : 0;
+                }
+                std::fill(cipher_indices.get() + text_len,
+                    cipher_indices.get() + padded_len, 0);
+            };
+
+
+            // FULL hits: build plaintext + spacing and record candidates
+            for (const auto& h : gres.full_hits)
             {
-                ++result.combos;
-                ++combos_counter;
+                if (h.alphabet_id >= alphabets.size()) continue;
+                const auto& alphabet = alphabets[h.alphabet_id];
+                if (h.key_id >= keys_slice.size()) continue;
+                const std::string& key_word = keys_slice[h.key_id];
 
-                auto& trashSet = trashBigramMap[mode];
+                // build key indices/valid
+                const std::size_t key_len = key_word.size();
+                if (!key_len) continue;
 
-                if (has_bigram && trashSet.find(key_bigram_code) != trashSet.end()) {
+                ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
+                ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
+                for (std::size_t i = 0; i < key_len; ++i) {
+                    int idx = alphabet_index(alphabet, key_word[i]);
+                    if (idx < 0) { key_valid[i] = 0; key_indices[i] = 0; }
+                    else { key_valid[i] = 1; key_indices[i] = static_cast<std::uint8_t>(idx); }
+                }
+
+                // rebuild cipher indices for this alphabet
+                rebuild_cipher_indices(alphabet);
+
+#if defined(__AVX2__)
+                ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
+                for (std::size_t start = 0; start < key_len; ++start) {
+                    auto& block = key_blocks[start];
+                    for (std::size_t j = 0; j < block.data.size(); ++j) {
+                        block.data[j] = key_indices[(start + j) % key_len];
+                    }
+                }
+#endif
+                decrypt_repeating(
+                    alphabet,
+                    static_cast<Mode>(h.mode),
+                    cipher_indices.get(),
+                    letter_mask.get(),
+                    key_indices.get(),
+                    key_valid.get(),
+                    key_len,
+                    plaintext_indices.get(),
+                    text_len,
+                    padded_len
+#if defined(__AVX2__)
+                    , key_blocks.get()
+#endif
+                );
+
+                std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
+
+                // device stats are fine to reuse
+                const double ioc = static_cast<double>(h.ioc);
+                const double chi = static_cast<double>(h.chi);
+
+                Candidate cand = make_candidate(
+                    key_word, alphabet, static_cast<Mode>(h.mode), /*autokey=*/false,
+                    plaintext, preview_length,
+                    spacing_pattern, spacing_words_by_length,
+                    ioc, chi);
+                maintain_top_results(result.best, cand, 10);
+            }
+
+            // Build a small set of (key,mode) that already had full hits to skip duplicate autokey
+            struct KM { std::uint32_t k; std::uint8_t m; };
+            struct H { std::size_t operator()(const KM& x) const noexcept { return (std::size_t(x.k) << 2) ^ x.m; } };
+            struct E { bool operator()(const KM& a, const KM& b) const noexcept { return a.k == b.k && a.m == b.m; } };
+            std::unordered_set<KM, H, E> seen_full;
+            seen_full.reserve(gres.full_hits.size() * 2);
+            for (const auto& h : gres.full_hits) seen_full.insert({ h.key_id, h.mode });
+
+            // AUTOKEY on front-only (parity with CPU search surface)
+            if (include_autokey)
+            {
+                for (const auto& h : gres.front_hits)
+                {
+                    if (seen_full.find({ h.key_id, h.mode }) != seen_full.end()) continue;
+                    if (h.alphabet_id >= alphabets.size()) continue;
+                    if (h.key_id >= keys_slice.size()) continue;
+
+                    const auto& alphabet = alphabets[h.alphabet_id];
+                    const std::string& key_word = keys_slice[h.key_id];
+                    const std::size_t key_len = key_word.size();
+                    if (!key_len) continue;
+
+                    ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
+                    ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
+                    for (std::size_t i = 0; i < key_len; ++i) {
+                        int idx = alphabet_index(alphabet, key_word[i]);
+                        if (idx < 0) { key_valid[i] = 0; key_indices[i] = 0; }
+                        else { key_valid[i] = 1; key_indices[i] = static_cast<std::uint8_t>(idx); }
+                    }
+
+                    rebuild_cipher_indices(alphabet);
+
+                    ++result.autokey_attempts;
+                    ++autokey_counter;
+
+                    ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
+                    // Use the SAME semantics as your CPU autokey (tail rule)
+                    decrypt_autokey(
+                        cipher_indices.get(),
+                        text_len,
+                        key_indices.get(),
+                        key_len,
+                        autokey_plaintext.get(),
+                        static_cast<Mode>(h.mode));
+
+                    double ioc_auto = 0.0, chi_auto = 0.0;
+                    compute_stats_indices(autokey_plaintext.get(), text_len, alphabet, ioc_auto, chi_auto);
+
+                    if (ioc_auto > IOC_GATE && chi_auto < CHI_GATE) {
+                        std::string plaintext_auto =
+                            build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
+
+                        Candidate cand_auto = make_candidate(
+                            key_word, alphabet, static_cast<Mode>(h.mode),
+                            /*autokey=*/true,
+                            plaintext_auto, preview_length,
+                            spacing_pattern, spacing_words_by_length,
+                            ioc_auto, chi_auto);
+                        maintain_top_results(result.best, cand_auto, 10);
+                    }
+                }
+            }
+
+            // count each key once per processed batch (parity with your prior accounting)
+            ++result.keys_processed;
+            ++keys_counter;
+
+             //periodically merge local best into global
+            if ((a0 / A_BATCH) % 2 == 0) {
+                std::lock_guard<std::mutex> lock(results_mutex);
+                for (const auto& cand : result.best)
+                    maintain_top_results(global_results, cand, max_results);
+            }
+        }
+
+        return result;
+    }
+
+    // ---- CPU PATH (unchanged) ----
+    {
+        // Outer: alphabets
+        for (std::size_t a = 0; a < alphabet_count; ++a) {
+            const auto& alphabet = alphabets[a];
+
+            // build cipher_indices for this alphabet once
+            for (std::size_t i = 0; i < text_len; ++i) {
+                if (!letter_mask[i]) {
+                    cipher_indices[i] = 0;
+                    continue;
+                }
+                int idx = alphabet_index(alphabet, cipher[i]);
+                cipher_indices[i] = (idx >= 0)
+                    ? static_cast<std::uint8_t>(idx)
+                    : 0;
+            }
+            std::fill(cipher_indices.get() + text_len, cipher_indices.get() + padded_len, 0);
+
+            std::unordered_map<Mode, std::unordered_set<std::uint16_t>> trashBigramMap;
+
+            // Inner: keys assigned to this worker
+            for (std::size_t idx_k = begin; idx_k < end; ++idx_k) {
+                const std::string& key_word = keys[idx_k];
+
+                const std::size_t key_len = key_word.size();
+                ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
+                ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
+                for (std::size_t i = 0; i < key_len; ++i)
+                {
+                    int idx = alphabet_index(alphabet, key_word[i]);
+                    if (idx < 0) {
+                        key_valid[i] = 0;
+                        key_indices[i] = 0;
+                    }
+                    else {
+                        key_valid[i] = 1;
+                        key_indices[i] = static_cast<std::uint8_t>(idx);
+                    }
+                }
+
+                if (key_len == 0) {
                     continue;
                 }
 
-                if ((have_first2_filter || have_second4_filter) &&
-                    !passes_front_filters_repeating(
-                        cipher,
-                        key_word,
-                        alphabet,
-                        mode,
-                        have_first2_filter,
-                        have_second4_filter,
-                        two_letter_set,
-                        four_letter_set,
-                        trashSet))
-                {
-                    continue; // reject this (key, alphabet, mode) without full decrypt
+                std::uint16_t key_bigram_code = 0;
+                bool has_bigram = key_len >= 2;
+                if (has_bigram) {
+                    char a0 = key_word[0];
+                    char b0 = key_word[1];
+                    key_bigram_code = encode_bigram(a0, b0);
                 }
+
+                bool keyblockBuilt = false;
+
+                for (Mode mode : modes)
+                {
+                    ++result.combos;
+                    ++combos_counter;
+
+                    auto& trashSet = trashBigramMap[mode];
+
+                    if (has_bigram && trashSet.find(key_bigram_code) != trashSet.end()) {
+                        continue;
+                    }
+
+                    if ((have_first2_filter || have_second4_filter) &&
+                        !passes_front_filters_repeating(
+                            cipher,
+                            key_word,
+                            alphabet,
+                            mode,
+                            have_first2_filter,
+                            have_second4_filter,
+                            two_letter_set,
+                            four_letter_set,
+                            trashSet))
+                    {
+                        continue; // reject this (key, alphabet, mode) without full decrypt
+                    }
 
 #if defined(__AVX2__)
-
-                if (!keyblockBuilt)
-                {
-                    ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
-                    for (std::size_t start = 0; start < key_len; ++start) {
-                        auto& block = key_blocks[start];
-                        for (std::size_t j = 0; j < block.data.size(); ++j) {
-                            block.data[j] = key_indices[(start + j) % key_len];
+                    if (!keyblockBuilt)
+                    {
+                        ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
+                        for (std::size_t start = 0; start < key_len; ++start) {
+                            auto& block = key_blocks[start];
+                            for (std::size_t j = 0; j < block.data.size(); ++j) {
+                                block.data[j] = key_indices[(start + j) % key_len];
+                            }
                         }
+                        keyblockBuilt = true;
                     }
-                    keyblockBuilt = true;
-                }
 #endif
 
                     decrypt_repeating(
@@ -1271,89 +1450,85 @@ WorkerResult process_keys(
 #endif
                     );
 
-                double ioc, chi;
-                compute_stats_indices(plaintext_indices.get(), text_len, alphabet, ioc, chi);
+                    double ioc, chi;
+                    compute_stats_indices(plaintext_indices.get(), text_len, alphabet, ioc, chi);
 
-                // coarse gate: only pay for full string+spacing for promising stats
-                // tune these thresholds as you like
-                if (ioc > 0.05 && chi < 160.0) 
-                {
-                    std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
-
-                    Candidate cand = make_candidate(
-                        key_word, alphabet, mode, false,
-                        plaintext, preview_length,
-                        spacing_pattern, spacing_words_by_length, ioc, chi);
-                    maintain_top_results(result.best, cand, 10);
-                }
-
-
-                if (include_autokey)
-                 {
-                    ++result.autokey_attempts;
-                    ++autokey_counter;
-
-                    ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
-
-                    decrypt_autokey(
-                        cipher_indices.get(),
-                        text_len,
-                        key_indices.get(),
-                        key_len,
-                        autokey_plaintext.get(),
-                        mode);
-
-                    double ioc_auto = 0.0, chi_auto = 0.0;
-
-                    compute_stats_indices(
-                        autokey_plaintext.get(),
-                        text_len,
-                        alphabet,
-                        ioc_auto,
-                        chi_auto);
-
-                    if (ioc_auto > 0.05 && chi_auto < 160.0)
+                    if (ioc > 0.05 && chi < 160.0)
                     {
-                        std::string plaintext_auto =
-                            build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
+                        std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
 
-                        Candidate cand_auto = make_candidate(
-                            key_word,
+                        Candidate cand = make_candidate(
+                            key_word, alphabet, mode, false,
+                            plaintext, preview_length,
+                            spacing_pattern, spacing_words_by_length, ioc, chi);
+                        maintain_top_results(result.best, cand, 10);
+                    }
+
+                    if (include_autokey)
+                    {
+                        ++result.autokey_attempts;
+                        ++autokey_counter;
+
+                        ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
+
+                        decrypt_autokey(
+                            cipher_indices.get(),
+                            text_len,
+                            key_indices.get(),
+                            key_len,
+                            autokey_plaintext.get(),
+                            mode);
+
+                        double ioc_auto = 0.0, chi_auto = 0.0;
+
+                        compute_stats_indices(
+                            autokey_plaintext.get(),
+                            text_len,
                             alphabet,
-                            mode,
-                            /*autokey_variant=*/true,
-                            plaintext_auto,
-                            preview_length,
-                            spacing_pattern,
-                            spacing_words_by_length,
                             ioc_auto,
                             chi_auto);
 
-                        maintain_top_results(result.best, cand_auto, max_results);
-                    }
+                        if (ioc_auto > 0.05 && chi_auto < 160.0)
+                        {
+                            std::string plaintext_auto =
+                                build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
 
+                            Candidate cand_auto = make_candidate(
+                                key_word,
+                                alphabet,
+                                mode,
+                                /*autokey_variant=*/true,
+                                plaintext_auto,
+                                preview_length,
+                                spacing_pattern,
+                                spacing_words_by_length,
+                                ioc_auto,
+                                chi_auto);
+
+                            maintain_top_results(result.best, cand_auto, 10);
+                        }
+                    }
                 }
             }
 
+            // count each key once (not once per alphabet)
+            ++result.keys_processed;
+            ++keys_counter;
 
-        }
-
-        // count each key once (not once per alphabet)
-        ++result.keys_processed;
-        ++keys_counter;
-
-        //merge local best into global (you can make this periodic later)
-        if (a % 1000 == 0)
-        {
-            std::lock_guard<std::mutex> lock(results_mutex);
-            for (const auto& cand : result.best) {
-                maintain_top_results(global_results, cand, max_results);
+            // merge local best into global periodically
+            if (a % 1000 == 0)
+            {
+                std::lock_guard<std::mutex> lock(results_mutex);
+                for (const auto& cand : result.best) {
+                    maintain_top_results(global_results, cand, max_results);
+                }
             }
         }
-    }
 
-    return result;
+        return result;
+    }
 }
+
 
 
 void progress_loop(const std::atomic<bool> &done, double interval_seconds,
