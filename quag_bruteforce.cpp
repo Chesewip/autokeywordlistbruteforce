@@ -123,19 +123,76 @@ std::string clean_letters(const std::string &text) {
   return result;
 }
 
-std::vector<std::string> parse_wordlist(const std::string &text) {
-  std::vector<std::string> words;
-  std::string current;
-  std::istringstream stream(text);
-  while (std::getline(stream, current)) {
-    auto cleaned = clean_letters(current);
-    if (!cleaned.empty()) {
-      words.push_back(std::move(cleaned));
+// Build an "interrupted" key by restarting the key at each word boundary
+// defined by spacing_pattern. Each segment of length L takes the first L
+// characters of the key, repeating the key as needed.
+std::string build_interrupted_key(const std::string& key,
+    const std::vector<int>& spacing_pattern)
+{
+    if (key.size() < 6u)  // your constraint: need at least a 6-letter key
+        return {};
+
+    std::size_t total_len = 0;
+    for (int len : spacing_pattern)
+        if (len > 0)
+            total_len += static_cast<std::size_t>(len);
+
+    if (total_len == 0)
+        return {};
+
+    std::string out;
+    out.reserve(total_len);
+
+    for (int len : spacing_pattern)
+    {
+        if (len <= 0)
+            continue;
+
+        // For each word of length len, restart the key
+        for (int i = 0; i < len; ++i)
+        {
+            // repeat key within the word if the word is longer than key
+            out.push_back(key[static_cast<std::size_t>(i) % key.size()]);
+        }
     }
-  }
-  return words;
+
+    return out;
 }
 
+
+std::vector<std::string> parse_wordlist(const std::string& text,
+    const std::vector<int>* spacing_pattern = nullptr)
+{
+    std::vector<std::string> words;
+    std::string current;
+    std::istringstream stream(text);
+
+    const bool have_spacing = (spacing_pattern != nullptr &&
+        !spacing_pattern->empty());
+
+    while (std::getline(stream, current))
+    {
+        auto cleaned = clean_letters(current);
+        if (cleaned.empty())
+            continue;
+
+        // Always keep the base key
+        words.push_back(std::move(cleaned));
+        const std::string& base = words.back();
+
+        // For keys >= 6 letters, add the interrupted variant if spacing is available
+        if (have_spacing && base.size() >= 6u)
+        {
+            std::string interrupted = build_interrupted_key(base, *spacing_pattern);
+            if (!interrupted.empty())
+            {
+                words.push_back(std::move(interrupted));
+            }
+        }
+    }
+
+    return words;
+}
 inline std::uint16_t encode_bigram(char a, char b) {
     return static_cast<std::uint16_t>((a - 'A') * 26 + (b - 'A'));
 }
@@ -1579,72 +1636,85 @@ void progress_loop(const std::atomic<bool> &done, double interval_seconds,
 
 } // namespace
 
-int main(int argc, char *argv[]) {
-  try {
-    Options options = parse_options(argc, argv);
+int main(int argc, char* argv[]) {
+    try {
+        Options options = parse_options(argc, argv);
 
 #ifdef __AVX2__
-    std::cout << "__AVX2__ is defined\n";
+        std::cout << "__AVX2__ is defined\n";
 #else
-    std::cout << "__AVX2__ is NOT defined\n";
+        std::cout << "__AVX2__ is NOT defined\n";
 #endif
 
-    const std::string cipher = clean_letters(options.ciphertext);
-    const std::vector<std::string> key_words = parse_wordlist(options.wordlist);
-    if (key_words.empty()) {
-      throw std::runtime_error("Wordlist is empty after cleaning");
-    }
-    const std::vector<std::string> alphabet_words =
-        parse_wordlist(options.alphabet_wordlist);
-    if (alphabet_words.empty()) {
-      throw std::runtime_error(
-          "Alphabet wordlist is empty after cleaning");
-    }
-    std::vector<std::string> spacing_words;
-    if (!options.spacing_wordlist.empty()) {
-      spacing_words = parse_wordlist(options.spacing_wordlist);
-      if (spacing_words.empty()) {
-        throw std::runtime_error(
-            "Spacing wordlist is empty after cleaning");
-      }
-    }
-    std::vector<int> spacing_pattern;
-    std::unordered_map<int, std::unordered_set<std::string>>
-        spacing_words_by_length;
-    if (!options.spacing_guide.empty()) {
-      spacing_pattern = parse_spacing_pattern(options.spacing_guide);
-      if (spacing_pattern.empty()) {
-        throw std::runtime_error(
-            "Spacing guide did not contain any valid word lengths");
-      }
-      if (spacing_words.empty()) {
-        throw std::runtime_error(
-            "Spacing guide requires a spacing wordlist");
-      }
-      spacing_words_by_length = build_words_by_length(spacing_words);
-    }
-    const bool spacing_scoring_enabled =
-        !spacing_pattern.empty() && !spacing_words_by_length.empty();
-    const std::unordered_set<std::uint16_t> two_letter_set =
-        parse_two_letter_list(options.two_letter_list);
-    const std::unordered_set<std::uint32_t> four_letter_set = !spacing_words.empty()
-        ? build_four_letter_set(spacing_words)
-        : build_four_letter_set(key_words);
+        const std::string cipher = clean_letters(options.ciphertext);
 
-    const bool have_first2_filter = !two_letter_set.empty();
-    const bool have_second4_filter = !four_letter_set.empty();
+        // --- spacing words (unchanged) ---
+        std::vector<std::string> spacing_words;
+        if (!options.spacing_wordlist.empty()) {
+            spacing_words = parse_wordlist(options.spacing_wordlist);
+            if (spacing_words.empty()) {
+                throw std::runtime_error(
+                    "Spacing wordlist is empty after cleaning");
+            }
+        }
 
-    std::vector<AlphabetCandidate> alphabets =
-        build_alphabet_candidates(alphabet_words, options);
-    if (alphabets.empty()) {
-      throw std::runtime_error("No alphabet candidates generated from wordlist");
-    }
+        // --- spacing pattern / guide (unchanged semantics) ---
+        std::vector<int> spacing_pattern;
+        std::unordered_map<int, std::unordered_set<std::string>>
+            spacing_words_by_length;
+        if (!options.spacing_guide.empty()) {
+            spacing_pattern = parse_spacing_pattern(options.spacing_guide);
+            if (spacing_pattern.empty()) {
+                throw std::runtime_error(
+                    "Spacing guide did not contain any valid word lengths");
+            }
+            if (spacing_words.empty()) {
+                throw std::runtime_error(
+                    "Spacing guide requires a spacing wordlist");
+            }
+            spacing_words_by_length = build_words_by_length(spacing_words);
+        }
 
-    std::vector<Mode> modes = {Mode::kVigenere, Mode::kBeaufort,
-                               Mode::kVariantBeaufort};
+        const bool spacing_scoring_enabled =
+            !spacing_pattern.empty() && !spacing_words_by_length.empty();
 
-    const std::size_t total_combos =
-        key_words.size() * alphabets.size() * modes.size();
+        // --- KEY WORDS: now we add interrupted variants here ---
+        std::vector<std::string> key_words =
+            parse_wordlist(options.wordlist,
+                spacing_pattern.empty() ? nullptr : &spacing_pattern);
+
+        if (key_words.empty()) {
+            throw std::runtime_error("Wordlist is empty after cleaning");
+        }
+
+        // --- alphabet words stay as plain words ---
+        const std::vector<std::string> alphabet_words =
+            parse_wordlist(options.alphabet_wordlist);
+        if (alphabet_words.empty()) {
+            throw std::runtime_error(
+                "Alphabet wordlist is empty after cleaning");
+        }
+
+        const std::unordered_set<std::uint16_t> two_letter_set =
+            parse_two_letter_list(options.two_letter_list);
+        const std::unordered_set<std::uint32_t> four_letter_set = !spacing_words.empty()
+            ? build_four_letter_set(spacing_words)
+            : build_four_letter_set(key_words);
+
+        const bool have_first2_filter = !two_letter_set.empty();
+        const bool have_second4_filter = !four_letter_set.empty();
+
+        std::vector<AlphabetCandidate> alphabets =
+            build_alphabet_candidates(alphabet_words, options);
+        if (alphabets.empty()) {
+            throw std::runtime_error("No alphabet candidates generated from wordlist");
+        }
+
+        std::vector<Mode> modes = { Mode::kVigenere, Mode::kBeaufort,
+                                   Mode::kVariantBeaufort };
+
+        const std::size_t total_combos =
+            key_words.size() * alphabets.size() * modes.size();
 
     std::cout << "Cipher length: " << cipher.size() << '\n';
     std::cout << "Key candidates: " << key_words.size() << '\n';
