@@ -2,6 +2,12 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <array>
+
+namespace {
+    // Must match __constant__ N in gpu_quag.cu
+    static constexpr int GPU_PLAINTEXT_STRIDE = 96;
+}
 
 // One (alphabet, mode) tile worth of data (padded to 96)
 struct DeviceAlphabetTile {
@@ -44,6 +50,12 @@ struct PackedKeysHostLetters {
     std::size_t num_keys() const { return key_lengths.size(); }
 };
 
+struct WordCodeTable
+{
+    std::vector<uint32_t> codes;         // concatenated; sorted within each length
+    std::array<int, 8>    offsets{};     // offsets[len]..offsets[len+1]-1 = that length's words
+};
+
 // Upload prebuilt bigram/quadgram bitsets to constant/device memory (your existing impl)
 void build_bigram_bitset(const std::vector<std::uint16_t>& codes,
     std::vector<std::uint32_t>& bitset_out);
@@ -51,6 +63,8 @@ void build_quadgram_bitset(const std::vector<std::uint32_t>& codes,
     std::vector<std::uint32_t>& bitset_out);
 void gpu_upload_gram_bitsets(const std::vector<std::uint32_t>& bigram_bits,
     const std::vector<std::uint32_t>& quad_bits);
+
+void gpu_upload_spacing_and_words(const std::vector<int>& spacing_pattern, const WordCodeTable& table);
 
 // New mega-batch launcher (one launch for many alphabets × all 3 modes)
 GpuBatchResult launch_q3_gpu_megabatch(const std::vector<DeviceAlphabetTile>& tiles,

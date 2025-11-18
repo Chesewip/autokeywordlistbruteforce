@@ -22,8 +22,14 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include "gpu_quag.h"
 #include <numeric>
+
+#include "Source/gpu_quag.h"
+#include "Source/WordListParser.h"
+#include "Source/AlphabetBuilder.h"
+#include "Source/Options.h"
+#include "Source/CPUDecode.h"
+#include "Source/GPUDecode.h"
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -31,853 +37,19 @@
 
 namespace {
 
-constexpr std::array<double, 26> kEnglishFreq = {
-    0.08167, 0.01492, 0.02782, 0.04253, 0.12702, 0.02228, 0.02015,
-    0.06094, 0.06966, 0.00153, 0.00772, 0.04025, 0.02406, 0.06749,
-    0.07507, 0.01929, 0.00095, 0.05987, 0.06327, 0.09056, 0.02758,
-    0.00978, 0.02360, 0.00150, 0.01974, 0.00074};
-
-constexpr double kIocTarget = 0.066;
 
 
-enum class Mode {
-  kVigenere,
-  kBeaufort,
-  kVariantBeaufort,
+
+
+struct PhraseNode
+{
+    std::vector<std::uint32_t> word_ids;  // indices into keys_slice
+    std::uint32_t alphabet_id{ 0 };
+    std::uint8_t  mode{ 0 };             // Mode enum value
+    std::uint16_t key_len{ 0 };          // total key length in letters
+    double        prefix_score{ 0.0 };   // e.g., IoC or any heuristic
 };
 
-struct AlphabetCandidate {
-  std::string alphabet;
-  std::array<int, 26> index_map{};
-  std::string base_word;
-  bool keyword_reversed = false;
-  bool alphabet_reversed = false;
-  bool keyword_front = true;
-};
-
-#if defined(__AVX2__)
-struct alignas(32) KeyBlock {
-  std::array<std::uint8_t, 32> data{};
-};
-#endif
-
-struct Candidate {
-  double score = 0.0;
-  double ioc = 0.0;
-  double chi = 0.0;
-  std::string key;
-  Mode mode = Mode::kVigenere;
-  bool autokey = false;
-  std::string alphabet_word;
-  bool alphabet_keyword_reversed = false;
-  bool alphabet_base_reversed = false;
-  bool alphabet_keyword_front = true;
-  std::string alphabet_string;
-  std::string first2;
-  std::string plaintext_preview;
-  int spacing_matches = -1;
-  int spacing_total = 0;
-};
-
-struct Options {
-  std::string ciphertext;
-  std::string wordlist;
-  std::string alphabet_wordlist;
-  std::string two_letter_list;
-  std::string spacing_wordlist;
-  std::string spacing_guide;
-  std::size_t max_results = 50;
-  std::size_t preview_length = 80;
-  std::size_t threads = std::max<std::size_t>(1, std::thread::hardware_concurrency());
-  bool include_autokey = false;
-  double progress_interval_seconds = 1.0;
-  bool quiet = false;
-  bool use_cuda = true;
-  bool include_keyword_front = true;
-  bool include_reversed_keyword_front = true;
-  bool include_keyword_back = true;
-  bool include_keyword_front_reversed_alphabet = true;
-  bool include_keyword_back_reversed_alphabet = true;
-};
-
-std::string read_file(const std::string &path) {
-  std::ifstream input(path);
-  if (!input) {
-    throw std::runtime_error("Failed to open file: " + path);
-  }
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  return buffer.str();
-}
-
-std::string clean_letters(const std::string &text) {
-  std::string result;
-  result.reserve(text.size());
-  for (char ch : text) {
-    if (ch >= 'A' && ch <= 'Z') {
-      result.push_back(ch);
-    } else if (ch >= 'a' && ch <= 'z') {
-      result.push_back(static_cast<char>('A' + (ch - 'a')));
-    }
-  }
-  return result;
-}
-
-// Build an "interrupted" key by restarting the key at each word boundary
-// defined by spacing_pattern. Each segment of length L takes the first L
-// characters of the key, repeating the key as needed.
-std::string build_interrupted_key(const std::string& key,
-    const std::vector<int>& spacing_pattern)
-{
-    if (key.size() < 6u)  // your constraint: need at least a 6-letter key
-        return {};
-
-    std::size_t total_len = 0;
-    for (int len : spacing_pattern)
-        if (len > 0)
-            total_len += static_cast<std::size_t>(len);
-
-    if (total_len == 0)
-        return {};
-
-    std::string out;
-    out.reserve(total_len);
-
-    for (int len : spacing_pattern)
-    {
-        if (len <= 0)
-            continue;
-
-        // For each word of length len, restart the key
-        for (int i = 0; i < len; ++i)
-        {
-            // repeat key within the word if the word is longer than key
-            out.push_back(key[static_cast<std::size_t>(i) % key.size()]);
-        }
-    }
-
-    return out;
-}
-
-
-std::vector<std::string> parse_wordlist(const std::string& text,
-    const std::vector<int>* spacing_pattern = nullptr)
-{
-    std::vector<std::string> words;
-    std::string current;
-    std::istringstream stream(text);
-
-    const bool have_spacing = (spacing_pattern != nullptr &&
-        !spacing_pattern->empty());
-
-    while (std::getline(stream, current))
-    {
-        auto cleaned = clean_letters(current);
-        if (cleaned.empty())
-            continue;
-
-        // Always keep the base key
-        words.push_back(std::move(cleaned));
-        const std::string& base = words.back();
-
-        // For keys >= 6 letters, add the interrupted variant if spacing is available
-        if (have_spacing && base.size() >= 6u)
-        {
-            std::string interrupted = build_interrupted_key(base, *spacing_pattern);
-            if (!interrupted.empty())
-            {
-                words.push_back(std::move(interrupted));
-            }
-        }
-    }
-
-    return words;
-}
-inline std::uint16_t encode_bigram(char a, char b) {
-    return static_cast<std::uint16_t>((a - 'A') * 26 + (b - 'A'));
-}
-
-inline std::uint32_t encode_quad(char a, char b, char c, char d) {
-    // assume A-Z; caller should validate if needed
-    int ia = a - 'A';
-    int ib = b - 'A';
-    int ic = c - 'A';
-    int id = d - 'A';
-
-    // (((a * 26) + b) * 26 + c) * 26 + d
-    return static_cast<std::uint32_t>(
-        (((ia * 26 + ib) * 26 + ic) * 26 + id)
-        );
-}
-
-std::unordered_set<std::uint16_t> parse_two_letter_list(const std::string& text) {
-    std::unordered_set<std::uint16_t> pairs;
-
-    std::string current;
-    std::istringstream stream(text);
-
-    while (std::getline(stream, current)) {
-        auto cleaned = clean_letters(current);  // already uppercases
-        if (cleaned.size() == 2) {
-            char a = cleaned[0];
-            char b = cleaned[1];
-
-            // Optional: be defensive, skip non A-Z
-            if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') {
-                continue;
-            }
-
-            pairs.insert(encode_bigram(a, b));
-        }
-    }
-
-    return pairs;
-}
-
-
-std::unordered_set<std::uint32_t> build_four_letter_set(const std::vector<std::string>& words) 
-{
-    std::unordered_set<std::uint32_t> result;
-    for (const auto& w : words) {
-        if (w.size() == 4) {
-            char a = w[0];
-            char b = w[1];
-            char c = w[2];
-            char d = w[3];
-
-            // be defensive if you like
-            if (a < 'A' || a > 'Z' ||
-                b < 'A' || b > 'Z' ||
-                c < 'A' || c > 'Z' ||
-                d < 'A' || d > 'Z') {
-                continue;
-            }
-
-            result.insert(encode_quad(a, b, c, d));
-        }
-    }
-    return result;
-}
-
-std::unordered_map<int, std::unordered_set<std::string>>
-build_words_by_length(const std::vector<std::string> &words) {
-  std::unordered_map<int, std::unordered_set<std::string>> grouped;
-  for (const auto &word : words) {
-    grouped[static_cast<int>(word.size())].insert(word);
-  }
-  return grouped;
-}
-
-std::vector<int> parse_spacing_pattern(const std::string &pattern_text) {
-  std::vector<int> pattern;
-  int current = 0;
-  bool in_number = false;
-  for (char ch : pattern_text) {
-    if (std::isdigit(static_cast<unsigned char>(ch))) {
-      current = current * 10 + (ch - '0');
-      in_number = true;
-    } else {
-      if (in_number) {
-        if (current <= 0) {
-          throw std::runtime_error("Spacing guide values must be positive integers");
-        }
-        pattern.push_back(current);
-        current = 0;
-        in_number = false;
-      }
-    }
-  }
-  if (in_number) {
-    if (current <= 0) {
-      throw std::runtime_error("Spacing guide values must be positive integers");
-    }
-    pattern.push_back(current);
-  }
-  return pattern;
-}
-
-std::pair<int, int> count_spacing_matches(
-    const std::string &plaintext, const std::vector<int> &pattern,
-    const std::unordered_map<int, std::unordered_set<std::string>> &words_by_length) {
-  if (pattern.empty() || words_by_length.empty()) {
-    return {-1, 0};
-  }
-  int matches = 0;
-  int considered = 0;
-  std::size_t offset = 0;
-  for (int length : pattern) {
-    if (length <= 0) {
-      continue;
-    }
-    if (offset + static_cast<std::size_t>(length) > plaintext.size()) {
-      break;
-    }
-    auto it = words_by_length.find(length);
-    if (it == words_by_length.end() || it->second.empty()) {
-      offset += static_cast<std::size_t>(length);
-      continue;
-    }
-    const std::string word = plaintext.substr(offset, static_cast<std::size_t>(length));
-    ++considered;
-    if (it->second.find(word) != it->second.end()) {
-      ++matches;
-    }
-    offset += static_cast<std::size_t>(length);
-  }
-  return {matches, considered};
-}
-
-std::string build_keyed_alphabet(const std::string& word, bool keyword_reversed,
-    bool alphabet_reversed, bool keyword_front) {
-    std::array<bool, 26> seen{};
-    std::string ordered_word;
-    if (keyword_reversed) {
-        ordered_word.assign(word.rbegin(), word.rend());
-    }
-    else {
-        ordered_word = word;
-    }
-
-    std::string unique_key;
-    unique_key.reserve(ordered_word.size());
-    for (char ch : ordered_word) {
-        int idx = ch - 'A';
-        if (idx >= 0 && idx < 26 && !seen[idx]) {
-            seen[idx] = true;
-            unique_key.push_back(ch);
-        }
-    }
-
-    std::string alphabet;
-    alphabet.reserve(26);
-
-    if (keyword_front) {
-        alphabet.append(unique_key);
-    }
-
-    if (alphabet_reversed) {
-        for (int i = 25; i >= 0; --i) {
-            if (!seen[i]) {
-                alphabet.push_back(static_cast<char>('A' + i));
-            }
-        }
-    }
-    else {
-        for (int i = 0; i < 26; ++i) {
-            if (!seen[i]) {
-                alphabet.push_back(static_cast<char>('A' + i));
-            }
-        }
-    }
-
-    if (!keyword_front) {
-        alphabet.append(unique_key);
-    }
-
-    return alphabet;
-}
-
-bool same_candidate_identity(const Candidate& a, const Candidate& b)
-{
-    return a.key == b.key
-        && a.mode == b.mode
-        && a.autokey == b.autokey
-        && a.alphabet_string == b.alphabet_string;
-}
-
-std::string build_plaintext_string(const AlphabetCandidate& alphabet,
-    const std::uint8_t* plaintext_indices,
-    std::size_t text_len)
-{
-    std::string result;
-    result.resize(text_len);
-    const std::string& alph = alphabet.alphabet;
-
-    for (std::size_t i = 0; i < text_len; ++i) {
-        std::uint8_t idx = plaintext_indices[i];
-        // assume idx < 26 for valid positions
-        result[i] = alph[idx];
-    }
-    return result;
-}
-
-AlphabetCandidate make_alphabet_candidate(const std::string &word,
-                                          bool keyword_reversed,
-                                          bool alphabet_reversed,
-                                          bool keyword_front) {
-  AlphabetCandidate candidate;
-  candidate.base_word = word;
-  candidate.keyword_reversed = keyword_reversed;
-  candidate.alphabet_reversed = alphabet_reversed;
-  candidate.keyword_front = keyword_front;
-  candidate.alphabet =
-      build_keyed_alphabet(word, keyword_reversed, alphabet_reversed, keyword_front);
-  candidate.index_map.fill(-1);
-  for (std::size_t i = 0; i < candidate.alphabet.size(); ++i) {
-    char ch = candidate.alphabet[i];
-    candidate.index_map[ch - 'A'] = static_cast<int>(i);
-  }
-  return candidate;
-}
-
-std::vector<AlphabetCandidate>
-build_alphabet_candidates(const std::vector<std::string> &words,
-                          const Options &options) {
-  std::map<std::string, AlphabetCandidate> unique_map;
-  for (const auto &word : words) {
-    if (options.include_keyword_front) {
-      AlphabetCandidate forward =
-          make_alphabet_candidate(word, false, false, true);
-      unique_map.emplace(forward.alphabet, forward);
-    }
-    if (options.include_reversed_keyword_front) {
-      AlphabetCandidate reversed_key =
-          make_alphabet_candidate(word, true, false, true);
-      unique_map.emplace(reversed_key.alphabet, reversed_key);
-    }
-    if (options.include_keyword_back) {
-      AlphabetCandidate back = make_alphabet_candidate(word, false, false, false);
-      unique_map.emplace(back.alphabet, back);
-    }
-    if (options.include_keyword_front_reversed_alphabet) {
-      AlphabetCandidate rev_alphabet_front =
-          make_alphabet_candidate(word, false, true, true);
-      unique_map.emplace(rev_alphabet_front.alphabet, rev_alphabet_front);
-    }
-    if (options.include_keyword_back_reversed_alphabet) {
-      AlphabetCandidate rev_alphabet_back =
-          make_alphabet_candidate(word, false, true, false);
-      unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
-    }
-    if (true) { //Reversed alphabet and reverse key forgot to add, just always true for now
-        AlphabetCandidate rev_alphabet_back =
-            make_alphabet_candidate(word, true, true, false);
-        unique_map.emplace(rev_alphabet_back.alphabet, rev_alphabet_back);
-    }
-  }
-  std::vector<AlphabetCandidate> result;
-  result.reserve(unique_map.size());
-  for (auto &entry : unique_map) {
-    result.push_back(std::move(entry.second));
-  }
-  return result;
-}
-
-inline int alphabet_index(const AlphabetCandidate &alphabet, char ch) {
-  if (ch < 'A' || ch > 'Z') {
-    return -1;
-  }
-  return alphabet.index_map[ch - 'A'];
-}
-
-inline std::uint8_t decrypt_symbol(std::uint8_t cipher_idx,
-                                   std::uint8_t key_idx, Mode mode) {
-  int value = 0;
-  switch (mode) {
-  case Mode::kVigenere:
-    value = static_cast<int>(cipher_idx) - static_cast<int>(key_idx);
-    if (value < 0) {
-      value += 26;
-    }
-    break;
-  case Mode::kBeaufort:
-    value = static_cast<int>(key_idx) - static_cast<int>(cipher_idx);
-    if (value < 0) {
-      value += 26;
-    }
-    break;
-  case Mode::kVariantBeaufort:
-    value = static_cast<int>(cipher_idx) + static_cast<int>(key_idx);
-    if (value >= 26) {
-      value -= 26;
-    }
-    break;
-  }
-  return static_cast<std::uint8_t>(value);
-}
-
-void decrypt_repeating(
-    const AlphabetCandidate& alphabet,
-    Mode mode,
-    const std::uint8_t* cipher_indices,
-    const std::uint8_t* letter_mask,
-    const std::uint8_t* key_indices,
-    const std::uint8_t* key_valid,
-    std::size_t key_len,
-    std::uint8_t* plaintext_indices,
-    std::size_t text_len,
-    std::size_t padded_len
-#if defined(__AVX2__)
-    , const KeyBlock* key_blocks
-#endif
-)
-{
-    (void)alphabet;
-    if (padded_len == 0 || key_len == 0 || plaintext_indices == nullptr) {
-        return;
-    }
-
-#if defined(__AVX2__)
-    constexpr std::size_t kVecWidth = 32;
-    const std::size_t vec_blocks = padded_len / kVecWidth;
-
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i twenty_six = _mm256_set1_epi8(26);
-    const __m256i twenty_five = _mm256_set1_epi8(25);
-
-    std::size_t vec_index = 0;
-    std::size_t block_offset = 0;
-
-    switch (mode)
-    {
-    case Mode::kVigenere:
-        for (std::size_t b = 0; b < vec_blocks; ++b) {
-            __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
-            __m256i key_vec = _mm256_load_si256(
-                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-
-            __m256i plain_vec = _mm256_sub_epi8(cipher_vec, key_vec);
-            __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
-            plain_vec = _mm256_add_epi8(
-                plain_vec, _mm256_and_si256(mask, twenty_six));
-
-            _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
-                plain_vec);
-
-            vec_index += kVecWidth;
-            block_offset = (block_offset + kVecWidth) % key_len;
-        }
-        break;
-
-    case Mode::kBeaufort:
-        for (std::size_t b = 0; b < vec_blocks; ++b) {
-            __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
-            __m256i key_vec = _mm256_load_si256(
-                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-
-            __m256i plain_vec = _mm256_sub_epi8(key_vec, cipher_vec);
-            __m256i mask = _mm256_cmpgt_epi8(zero, plain_vec);
-            plain_vec = _mm256_add_epi8(
-                plain_vec, _mm256_and_si256(mask, twenty_six));
-
-            _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
-                plain_vec);
-
-            vec_index += kVecWidth;
-            block_offset = (block_offset + kVecWidth) % key_len;
-        }
-        break;
-
-    case Mode::kVariantBeaufort:
-        for (std::size_t b = 0; b < vec_blocks; ++b) {
-            __m256i cipher_vec = _mm256_loadu_si256(
-                reinterpret_cast<const __m256i*>(cipher_indices + vec_index));
-            __m256i key_vec = _mm256_load_si256(
-                reinterpret_cast<const __m256i*>(key_blocks[block_offset].data.data()));
-
-            __m256i plain_vec = _mm256_add_epi8(cipher_vec, key_vec);
-            __m256i mask = _mm256_cmpgt_epi8(plain_vec, twenty_five);
-            plain_vec = _mm256_sub_epi8(
-                plain_vec, _mm256_and_si256(mask, twenty_six));
-
-            _mm256_storeu_si256(
-                reinterpret_cast<__m256i*>(plaintext_indices + vec_index),
-                plain_vec);
-
-            vec_index += kVecWidth;
-            block_offset = (block_offset + kVecWidth) % key_len;
-        }
-        break;
-    }
-#else
-    for (std::size_t i = 0; i < text_len; ++i) {
-        if (!letter_mask[i] || !key_valid[i % key_len]) {
-            plaintext_indices[i] = 0;
-            continue;
-        }
-        plaintext_indices[i] =
-            decrypt_symbol(cipher_indices[i], key_indices[i % key_len], mode);
-    }
-#endif
-
-}
-
-void decrypt_autokey(
-    const std::uint8_t* cipher_indices,
-    std::size_t cipher_len,
-    const std::uint8_t* key_indices,
-    std::size_t key_len,
-    std::uint8_t* plaintext_indices,
-    Mode mode)
-{
-    if (cipher_len == 0 || key_len == 0 || plaintext_indices == nullptr) {
-        return;
-    }
-
-    for (std::size_t i = 0; i < cipher_len; ++i) {
-        std::uint8_t c_idx = cipher_indices[i];
-        std::uint8_t k_idx = (i < key_len)
-            ? key_indices[i]
-            : plaintext_indices[i - key_len];
-        plaintext_indices[i] = decrypt_symbol(c_idx, k_idx, mode);
-    }
-}
-
-void compute_stats_indices(const std::uint8_t* plain,
-    std::size_t n,
-    const AlphabetCandidate& alphabet,
-    double& out_ioc,
-    double& out_chi)
-{
-    if (n <= 1) {
-        out_ioc = 0.0;
-        out_chi = std::numeric_limits<double>::infinity();
-        return;
-    }
-
-    const std::string& alph = alphabet.alphabet; // keyed alphabet
-
-    std::array<std::size_t, 26> counts{};
-    for (std::size_t i = 0; i < n; ++i) {
-        std::uint8_t idx = plain[i];
-        if (idx < 26) {
-            char ch = alph[idx];  // map keyed index  actual letter
-            if (ch >= 'A' && ch <= 'Z') {
-                counts[static_cast<std::size_t>(ch - 'A')]++;
-            }
-        }
-    }
-
-    double numerator = 0.0;
-    double chi = 0.0;
-
-    for (std::size_t i = 0; i < 26; ++i) {
-        std::size_t c = counts[i];
-        numerator += static_cast<double>(c) * static_cast<double>(c - 1);
-
-        double expected = static_cast<double>(n) * kEnglishFreq[i];
-        if (expected > 0.0) {
-            double diff = static_cast<double>(c) - expected;
-            chi += (diff * diff) / expected;
-        }
-    }
-
-    out_ioc = numerator / (static_cast<double>(n) * static_cast<double>(n - 1));
-    out_chi = chi;
-}
-
-Candidate make_candidate(
-    const std::string &key_word, 
-    const AlphabetCandidate &alphabet, Mode mode,
-    bool autokey_variant, 
-    const std::string &plaintext,
-    std::size_t preview_length, 
-    const std::vector<int> *spacing_pattern,
-    const std::unordered_map<int, std::unordered_set<std::string>> *spacing_words_by_length,
-    double ioc, 
-    double chi2) 
-{
-
-    Candidate cand;
-    cand.key = key_word;
-    cand.mode = mode;
-    cand.autokey = autokey_variant;
-    cand.alphabet_word = alphabet.base_word;
-    cand.alphabet_keyword_reversed = alphabet.keyword_reversed;
-    cand.alphabet_base_reversed = alphabet.alphabet_reversed;
-    cand.alphabet_keyword_front = alphabet.keyword_front;
-    cand.alphabet_string = alphabet.alphabet;
-    cand.ioc = ioc;
-    cand.chi = chi2;
-    cand.plaintext_preview = plaintext.substr(0, std::min(preview_length, plaintext.size()));
-
-    const double ioc_delta = std::abs(cand.ioc - kIocTarget);
-    const double ioc_score = std::max(0.0, 1.0 - ioc_delta / 0.02);
-    const double chi_clamped = std::min(400.0, cand.chi);
-    const double chi_score = std::max(0.0, 1.0 - chi_clamped / 400.0);
-    const double quality_factor = 0.1 + 0.9 * chi_score;
-    const double stats_score = ioc_score * quality_factor;
-    const double word_weight = 0.8;
-    const double stats_weight = 1.0 - word_weight;
-    cand.score = stats_score;
-
-    auto result = count_spacing_matches(plaintext, *spacing_pattern,
-                                        *spacing_words_by_length);
-    cand.spacing_matches = result.first;
-    cand.spacing_total = result.second;
-
-    if (cand.spacing_matches >= 0 && cand.spacing_total > 0) 
-    {
-        double word_score = static_cast<double>(cand.spacing_matches) /
-                            static_cast<double>(cand.spacing_total);
-        cand.score = word_weight * word_score + stats_weight * stats_score;
-    }
-
-    return cand;
-}
-
-
-
-
-void maintain_top_results(std::vector<Candidate> &results, const Candidate &candidate,
-                          std::size_t max_results) {
-    if (max_results == 0) {
-        return;
-    }
-
-    // 1. Check if we already have this identity
-    auto existing = std::find_if(results.begin(), results.end(),
-        [&](const Candidate& c) {
-            return same_candidate_identity(c, candidate);
-        });
-
-    if (existing != results.end()) {
-        if (candidate.score > existing->score) {
-            *existing = candidate;
-        }
-        return; // don't add a duplicate row
-    }
-
-    // 2. Normal insert/replace logic
-    if (results.size() < max_results) {
-        results.push_back(candidate);
-        return;
-    }
-
-    auto worst_it = std::min_element(
-        results.begin(), results.end(),
-        [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
-
-    if (worst_it != results.end() && worst_it->score < candidate.score) {
-        *worst_it = candidate;
-    }
-}
-
-Options parse_options(int argc, char *argv[]) {
-  Options options;
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    auto require_value = [&](const std::string &name) -> std::string {
-      if (i + 1 >= argc) {
-        throw std::runtime_error("Missing value for option " + name);
-      }
-      return argv[++i];
-    };
-
-    if (arg == "--ciphertext") {
-      options.ciphertext = require_value(arg);
-    } else if (arg == "--ciphertext-file") {
-      options.ciphertext = read_file(require_value(arg));
-    } else if (arg == "--wordlist") {
-      options.wordlist = read_file(require_value(arg));
-    } else if (arg == "--wordlist-inline") {
-      options.wordlist = require_value(arg);
-    } else if (arg == "--alphabet-wordlist") {
-      options.alphabet_wordlist = read_file(require_value(arg));
-    } else if (arg == "--alphabet-wordlist-inline") {
-      options.alphabet_wordlist = require_value(arg);
-    } else if (arg == "--two-letter-list") {
-      options.two_letter_list = read_file(require_value(arg));
-    } else if (arg == "--two-letter-inline") {
-      options.two_letter_list = require_value(arg);
-    } else if (arg == "--spacing-wordlist") {
-      options.spacing_wordlist = read_file(require_value(arg));
-    } else if (arg == "--spacing-wordlist-inline") {
-      options.spacing_wordlist = require_value(arg);
-    } else if (arg == "--spacing-guide") {
-      options.spacing_guide = require_value(arg);
-    } else if (arg == "--spacing-guide-file") {
-      options.spacing_guide = read_file(require_value(arg));
-    } else if (arg == "--max-results") {
-      options.max_results = static_cast<std::size_t>(std::stoul(require_value(arg)));
-    } else if (arg == "--preview-length") {
-      options.preview_length = static_cast<std::size_t>(std::stoul(require_value(arg)));
-    } else if (arg == "--threads") {
-      options.threads = static_cast<std::size_t>(std::stoul(require_value(arg)));
-    } else if (arg == "--include-autokey") {
-      options.include_autokey = true;
-    } else if (arg == "--progress-interval") {
-      options.progress_interval_seconds = std::stod(require_value(arg));
-    } else if (arg == "--quiet") {
-      options.quiet = true;
-    } else if (arg == "--use-cuda") {
-      options.use_cuda = true;
-    } else if (arg == "--no-cuda") {
-      options.use_cuda = false;
-    } else if (arg == "--no-keyword-front") {
-      options.include_keyword_front = false;
-    } else if (arg == "--no-reversed-keyword-front") {
-      options.include_reversed_keyword_front = false;
-    } else if (arg == "--no-keyword-back") {
-      options.include_keyword_back = false;
-    } else if (arg == "--no-keyword-front-reversed") {
-      options.include_keyword_front_reversed_alphabet = false;
-    } else if (arg == "--no-keyword-back-reversed") {
-      options.include_keyword_back_reversed_alphabet = false;
-    } else if (arg == "--help" || arg == "-h") {
-      std::cout << "Quagmire III wordlist bruteforcer (C++)\n"
-                << "Options:\n"
-                << "  --ciphertext <text>             Inline ciphertext string\n"
-                << "  --ciphertext-file <path>        File containing ciphertext\n"
-                << "  --wordlist <path>               Main wordlist file (required)\n"
-                << "  --wordlist-inline <text>        Inline wordlist string\n"
-                << "  --alphabet-wordlist <path>      Alphabet wordlist file (defaults to main)\n"
-                << "  --alphabet-wordlist-inline <text> Inline alphabet wordlist string\n"
-                << "  --two-letter-list <path>        Optional 2-letter filter list\n"
-                << "  --two-letter-inline <text>      Inline 2-letter filter string\n"
-                << "  --spacing-wordlist <path>       Wordlist used for spacing guide scoring\n"
-                << "  --spacing-wordlist-inline <text> Inline spacing wordlist string\n"
-                << "  --spacing-guide <pattern>       Word length pattern (e.g. 2-4-3-3)\n"
-                << "  --spacing-guide-file <path>     File containing word length pattern\n"
-                << "  --max-results <N>               Max candidates to keep (default 50)\n"
-                << "  --preview-length <N>            Plaintext preview length (default 80)\n"
-                << "  --threads <N>                   Worker threads (default hardware)\n"
-                << "  --include-autokey               Try autokey variants too\n"
-                << "  --use-cuda                      Enable experimental CUDA execution\n"
-                << "  --no-cuda                       Force CPU execution (default)\n"
-                << "  --progress-interval <sec>       Progress update interval (default 1.0)\n"
-                << "  --quiet                         Suppress periodic progress output\n"
-                << "  --no-keyword-front              Skip key prefix on normal alphabet\n"
-                << "  --no-reversed-keyword-front     Skip reversed key prefix variant\n"
-                << "  --no-keyword-back               Skip key suffix on normal alphabet\n"
-                << "  --no-keyword-front-reversed     Skip key prefix on reversed alphabet\n"
-                << "  --no-keyword-back-reversed      Skip key suffix on reversed alphabet\n"
-                << "  --help                          Show this help message\n";
-      std::exit(0);
-    } else {
-      throw std::runtime_error("Unknown option: " + arg);
-    }
-  }
-
-  if (options.ciphertext.empty()) {
-    throw std::runtime_error("Ciphertext is required (use --ciphertext or --ciphertext-file)");
-  }
-  if (options.wordlist.empty()) {
-    throw std::runtime_error("Wordlist is required (use --wordlist or --wordlist-inline)");
-  }
-  if (options.alphabet_wordlist.empty()) {
-    options.alphabet_wordlist = options.wordlist;
-  }
-  if (!options.spacing_guide.empty() && options.spacing_wordlist.empty()) {
-    throw std::runtime_error(
-        "Spacing guide provided but spacing wordlist is missing (use --spacing-wordlist)");
-  }
-  if (options.threads == 0) {
-    options.threads = 1;
-  }
-  if (!options.include_keyword_front && !options.include_reversed_keyword_front &&
-      !options.include_keyword_back &&
-      !options.include_keyword_front_reversed_alphabet &&
-      !options.include_keyword_back_reversed_alphabet) {
-    throw std::runtime_error(
-        "All alphabet construction variants are disabled. Enable at least one option.");
-  }
-  return options;
-}
 
 std::string mode_family_name(Mode mode) {
   switch (mode) {
@@ -891,8 +63,8 @@ std::string mode_family_name(Mode mode) {
   return "";
 }
 
-std::string format_results_table(const std::vector<Candidate> &candidates,
-                                 std::size_t max_rows) {
+std::string format_results_table(const std::vector<Candidate> &candidates, std::size_t max_rows) 
+{
   std::ostringstream oss;
   if (candidates.empty()) {
     oss << "No candidates met the filtering criteria." << '\n';
@@ -948,13 +120,15 @@ std::string format_results_table(const std::vector<Candidate> &candidates,
   return oss.str();
 }
 
-void print_table(const std::vector<Candidate> &candidates, std::size_t max_rows) {
+void print_table(const std::vector<Candidate> &candidates, std::size_t max_rows) 
+{
   std::cout << format_results_table(candidates, max_rows);
 }
 
 void write_results_to_file(const std::vector<Candidate> &candidates,
                            std::size_t max_rows,
-                           const std::string &path) {
+                           const std::string &path) 
+{
   std::ofstream output(path);
   if (!output) {
     throw std::runtime_error("Failed to open results output file: " + path);
@@ -962,638 +136,51 @@ void write_results_to_file(const std::vector<Candidate> &candidates,
   output << format_results_table(candidates, max_rows);
 }
 
-bool passes_front_filters_repeating(
-    const std::string& cipher,
-    const std::string& key,
-    const AlphabetCandidate& alphabet,
-    Mode mode,
-    bool have_first2_filter,
-    bool have_second4_filter,
-    const std::unordered_set<std::uint16_t>& two_letter_set,
-    const std::unordered_set<std::uint32_t>& four_letter_set, 
-    std::unordered_set<std::uint16_t>& trash_letter_set)
+static bool validate_covered_words(
+    const std::string& plaintext,
+    const std::vector<int>& spacing_pattern,
+    const std::unordered_map<int, std::unordered_set<std::string>>& words_by_length,
+    int key_len)
 {
-    const std::size_t text_len = cipher.size();
-    if (text_len < 2) {
+    if (plaintext.empty() || key_len <= 0)
         return false;
-    }
 
-    const std::size_t key_len = key.size();
-    if (key_len == 0) {
-        return false;
-    }
+    int offset = 0;
+    const int max_len = std::min<int>((int)plaintext.size(), key_len);
+    bool saw_any_word = false;
 
-    const std::string& alph = alphabet.alphabet;
-
-    // We only need up to 6 chars: 2 for first word, 4 for second word.
-    const std::size_t needed =
-        have_second4_filter ? std::min<std::size_t>(6, text_len) : 2;
-
-    char buf[6];
-    std::size_t produced = 0;
-
-    for (std::size_t i = 0; i < needed; ++i) {
-        char c = cipher[i];
-        char out = c;  // default: keep cipher char (matches current behavior
-        // when key/alphabet indices are invalid)
-
-        int c_idx = alphabet_index(alphabet, c);
-        if (c_idx >= 0) {
-            char kch = key[i % key_len];
-            int k_idx = alphabet_index(alphabet, kch);
-            if (k_idx >= 0) {
-                std::uint8_t p_idx = decrypt_symbol(
-                    static_cast<std::uint8_t>(c_idx),
-                    static_cast<std::uint8_t>(k_idx),
-                    mode
-                );
-                if (p_idx < alph.size()) {
-                    out = alph[p_idx];
-                }
-            }
-        }
-
-        buf[produced++] = out;
-    }
-
-    if (produced < 2) {
-        return false;
-    }
-
-    if (have_first2_filter) {
-        char a = buf[0];
-        char b = buf[1];
-        if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') {
-            // definitely not in two_letter_codes
-            return false;
-        }
-        std::uint16_t code = encode_bigram(a, b);
-        if (two_letter_set.find(code) == two_letter_set.end()) 
-        {
-            trash_letter_set.insert(code);
-            return false;
-        }
-    }
-
-    if (have_second4_filter && produced >= 6) {
-        char a = buf[2];
-        char b = buf[3];
-        char c = buf[4];
-        char d = buf[5];
-
-        if (a < 'A' || a > 'Z' ||
-            b < 'A' || b > 'Z' ||
-            c < 'A' || c > 'Z' ||
-            d < 'A' || d > 'Z') {
-            return false;
-        }
-
-        std::uint32_t code4 = encode_quad(a, b, c, d);
-        if (four_letter_set.find(code4) == four_letter_set.end()) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-
-struct WorkerResult {
-  std::vector<Candidate> best;
-  std::size_t combos = 0;
-  std::size_t autokey_attempts = 0;
-  std::size_t keys_processed = 0;
-};
-
-WorkerResult process_keys(
-    const std::vector<std::string>& keys, std::size_t begin,
-    std::size_t end, const std::string& cipher,
-    const std::vector<AlphabetCandidate>& alphabets,
-    const std::vector<Mode>& modes,
-    const std::unordered_set<std::uint16_t>& two_letter_set,
-    const std::unordered_set<std::uint32_t>& four_letter_set,
-    bool have_first2_filter, bool have_second4_filter,
-    const std::vector<int>* spacing_pattern,
-    const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
-    std::size_t max_results, std::size_t preview_length,
-    bool include_autokey, bool use_cuda,
-    std::atomic<std::size_t>& combos_counter,
-    std::atomic<std::size_t>& autokey_counter,
-    std::atomic<std::size_t>& keys_counter,
-    std::mutex& results_mutex,
-    std::vector<Candidate>& global_results)
-{
-    WorkerResult result;
-    result.best.reserve(max_results);
-
-    const std::size_t alphabet_count = alphabets.size();
-    const std::size_t text_len = cipher.size();    // e.g. 85
-    constexpr std::size_t kVecWidth = 32;
-    const std::size_t padded_len =
-        ((text_len + kVecWidth - 1) / kVecWidth) * kVecWidth; // e.g. 96
-
-    // per-worker scratch buffers (padded)
-    std::unique_ptr<std::uint8_t[]> letter_mask(new std::uint8_t[padded_len]());
-    std::unique_ptr<std::uint8_t[]> cipher_indices(new std::uint8_t[padded_len]());
-    std::unique_ptr<std::uint8_t[]> plaintext_indices(new std::uint8_t[padded_len]());
-
-    std::unique_ptr<std::uint8_t[]> key_indices;
-    std::size_t key_indices_capacity = 0;
-    std::unique_ptr<std::uint8_t[]> key_valid;
-    std::size_t key_valid_capacity = 0;
-#if defined(__AVX2__)
-    std::unique_ptr<KeyBlock[]> key_blocks;
-    std::size_t key_block_capacity = 0;
-#endif
-    std::unique_ptr<std::uint8_t[]> autokey_plaintext;
-    std::size_t autokey_capacity = 0;
-
-    auto ensure_u8_capacity = [](std::unique_ptr<std::uint8_t[]>& buffer, std::size_t& capacity, std::size_t required) {
-        if (capacity < required) {
-            std::unique_ptr<std::uint8_t[]> new_buffer(new std::uint8_t[required]);
-            buffer.swap(new_buffer);
-            capacity = required;
-        }
-    };
-#if defined(__AVX2__)
-    auto ensure_keyblock_capacity = [](std::unique_ptr<KeyBlock[]>& buffer, std::size_t& capacity, std::size_t required) {
-        if (capacity < required) {
-            std::unique_ptr<KeyBlock[]> new_buffer(new KeyBlock[required]);
-            buffer.swap(new_buffer);
-            capacity = required;
-        }
-    };
-#endif
-
-    // build letter_mask once (A-Z only)
-    std::fill(letter_mask.get(), letter_mask.get() + padded_len, 0);
-    for (std::size_t i = 0; i < text_len; ++i) {
-        char c = cipher[i];
-        letter_mask[i] = (c >= 'A' && c <= 'Z') ? 1u : 0u;
-    }
-
-    // ---- GPU MEGA-BATCH PATH ----
-    if (use_cuda)
+    for (int len : spacing_pattern)
     {
-        // device gates
-        constexpr float IOC_GATE = 0.052f;
-        constexpr float CHI_GATE = 100.0f;
+        int end = offset + len;
+        if (end > key_len || end > max_len)
+            break; // this word is not fully covered yet
 
-        // Upload 2-gram / 4-gram filters once per worker
-        {
-            std::vector<std::uint16_t> bigram_codes;
-            bigram_codes.reserve(two_letter_set.size());
-            for (auto v : two_letter_set) bigram_codes.push_back(v);
+        if (end > (int)plaintext.size())
+            return false;
 
-            std::vector<std::uint32_t> quad_codes;
-            quad_codes.reserve(four_letter_set.size());
-            for (auto v : four_letter_set) quad_codes.push_back(v);
+        auto it = words_by_length.find(len);
+        if (it == words_by_length.end())
+            return false;
 
-            std::vector<std::uint32_t> two_bits, four_bits;
-            build_bigram_bitset(bigram_codes, two_bits);
-            build_quadgram_bitset(quad_codes, four_bits);
-            gpu_upload_gram_bitsets(two_bits, four_bits);
-        }
+        std::string word = plaintext.substr(offset, len);
+        if (it->second.find(word) == it->second.end())
+            return false; // covered word is not in dictionary
 
-        // Slice of keys for this worker [begin,end)
-        std::vector<std::string> keys_slice;
-        keys_slice.reserve(end - begin);
-        for (std::size_t i = begin; i < end; ++i) keys_slice.push_back(keys[i]);
-
-        // Pack keys ONCE as letters (device will map via index_map per alphabet)
-        PackedKeysHostLetters packed_letters;
-        {
-            packed_letters.key_offsets.resize(keys_slice.size());
-            packed_letters.key_lengths.resize(keys_slice.size());
-            packed_letters.key_chars_flat.reserve(
-                std::accumulate(keys_slice.begin(), keys_slice.end(), std::size_t(0),
-                    [](std::size_t s, const std::string& k) { return s + k.size(); }));
-
-            std::size_t off = 0;
-            for (std::size_t i = 0; i < keys_slice.size(); ++i) {
-                packed_letters.key_offsets[i] = static_cast<std::uint32_t>(off);
-                packed_letters.key_lengths[i] = static_cast<std::uint16_t>(keys_slice[i].size());
-                for (char ch : keys_slice[i]) {
-                    // assume already cleaned/uppercased
-                    packed_letters.key_chars_flat.push_back(static_cast<std::uint8_t>(ch));
-                }
-                off += keys_slice[i].size();
-            }
-        }
-
-        // Mega-batch alphabets per launch (tune). Aim to keep the GPU busy.
-        constexpr std::size_t A_BATCH = 4096; // try 2k–8k depending on VRAM
-
-        // Process alphabets in chunks of A_BATCH (each with 3 modes per alphabet)
-        for (std::size_t a0 = 0; a0 < alphabet_count; a0 += A_BATCH)
-        {
-            const std::size_t a1 = std::min(a0 + A_BATCH, alphabet_count);
-            const std::size_t batch_alphas = a1 - a0;
-
-            // Build all tiles for this mega-batch
-            std::vector<DeviceAlphabetTile> tiles;
-            tiles.reserve(batch_alphas * 3);
-
-            for (std::size_t a = a0; a < a1; ++a) {
-                const auto& alphabet = alphabets[a];
-
-                DeviceAlphabetTile base{};
-                // cipher_idx/mask per alphabet
-                for (std::size_t i = 0; i < text_len; ++i) {
-                    if (!letter_mask[i]) {
-                        base.cipher_idx[i] = 0;
-                        base.mask[i] = 0;
-                    }
-                    else {
-                        int idx = alphabet_index(alphabet, cipher[i]);
-                        base.cipher_idx[i] = (idx >= 0) ? static_cast<std::uint8_t>(idx) : 0;
-                        base.mask[i] = 1;
-                    }
-                }
-                // pad to 96
-                for (std::size_t i = text_len; i < padded_len; ++i) {
-                    base.cipher_idx[i] = 0; base.mask[i] = 0;
-                }
-                // keyed alphabet + index map
-                for (int j = 0; j < 26; ++j) {
-                    base.alph[j] = alphabet.alphabet[j];
-                    base.index_map[j] = static_cast<std::int8_t>(alphabet.index_map[j]); // -1 if absent
-                }
-                base.text_len = static_cast<int>(text_len);
-                base.alphabet_id = static_cast<std::uint32_t>(a);
-
-                // three modes
-                for (int m = 0; m < 3; ++m) {
-                    DeviceAlphabetTile t = base;
-                    t.mode = static_cast<std::uint8_t>(m);
-                    tiles.push_back(t);
-                }
-            }
-
-            // progress accounting (approximate): all key×mode within this batch
-            const std::size_t combos_for_batch = (end - begin) * 3 * batch_alphas;
-            result.combos += combos_for_batch;
-            combos_counter += combos_for_batch;
-
-            // choose caps (heuristic). You can make these CLI knobs.
-            const std::size_t max_full_hits = std::max<std::size_t>(packed_letters.num_keys() * tiles.size() / 1000, 8192);
-            const std::size_t max_front_hits = std::max<std::size_t>(packed_letters.num_keys() * tiles.size() / 500, 16384);
-
-            // one big launch for this batch
-            GpuBatchResult gres = launch_q3_gpu_megabatch(tiles, packed_letters, IOC_GATE, CHI_GATE,
-                max_full_hits, max_front_hits);
-
-            // For post-processing we’ll fetch the alphabet by absolute id per hit.
-            // We rebuild cipher_indices for that alphabet (tiny cost, 96B).
-            auto rebuild_cipher_indices = [&](const AlphabetCandidate& alphabet) {
-                for (std::size_t i = 0; i < text_len; ++i) {
-                    if (!letter_mask[i]) { cipher_indices[i] = 0; continue; }
-                    int idx = alphabet_index(alphabet, cipher[i]);
-                    cipher_indices[i] = (idx >= 0) ? static_cast<std::uint8_t>(idx) : 0;
-                }
-                std::fill(cipher_indices.get() + text_len,
-                    cipher_indices.get() + padded_len, 0);
-            };
-
-
-            // FULL hits: build plaintext + spacing and record candidates
-            for (const auto& h : gres.full_hits)
-            {
-                if (h.alphabet_id >= alphabets.size()) continue;
-                const auto& alphabet = alphabets[h.alphabet_id];
-                if (h.key_id >= keys_slice.size()) continue;
-                const std::string& key_word = keys_slice[h.key_id];
-
-                // build key indices/valid
-                const std::size_t key_len = key_word.size();
-                if (!key_len) continue;
-
-                ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
-                ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
-                for (std::size_t i = 0; i < key_len; ++i) {
-                    int idx = alphabet_index(alphabet, key_word[i]);
-                    if (idx < 0) { key_valid[i] = 0; key_indices[i] = 0; }
-                    else { key_valid[i] = 1; key_indices[i] = static_cast<std::uint8_t>(idx); }
-                }
-
-                // rebuild cipher indices for this alphabet
-                rebuild_cipher_indices(alphabet);
-
-#if defined(__AVX2__)
-                ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
-                for (std::size_t start = 0; start < key_len; ++start) {
-                    auto& block = key_blocks[start];
-                    for (std::size_t j = 0; j < block.data.size(); ++j) {
-                        block.data[j] = key_indices[(start + j) % key_len];
-                    }
-                }
-#endif
-                decrypt_repeating(
-                    alphabet,
-                    static_cast<Mode>(h.mode),
-                    cipher_indices.get(),
-                    letter_mask.get(),
-                    key_indices.get(),
-                    key_valid.get(),
-                    key_len,
-                    plaintext_indices.get(),
-                    text_len,
-                    padded_len
-#if defined(__AVX2__)
-                    , key_blocks.get()
-#endif
-                );
-
-                std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
-
-                // device stats are fine to reuse
-                const double ioc = static_cast<double>(h.ioc);
-                const double chi = static_cast<double>(h.chi);
-
-                Candidate cand = make_candidate(
-                    key_word, alphabet, static_cast<Mode>(h.mode), /*autokey=*/false,
-                    plaintext, preview_length,
-                    spacing_pattern, spacing_words_by_length,
-                    ioc, chi);
-                maintain_top_results(result.best, cand, 10);
-            }
-
-            // Build a small set of (key,mode) that already had full hits to skip duplicate autokey
-            struct KM { std::uint32_t k; std::uint8_t m; };
-            struct H { std::size_t operator()(const KM& x) const noexcept { return (std::size_t(x.k) << 2) ^ x.m; } };
-            struct E { bool operator()(const KM& a, const KM& b) const noexcept { return a.k == b.k && a.m == b.m; } };
-            std::unordered_set<KM, H, E> seen_full;
-            seen_full.reserve(gres.full_hits.size() * 2);
-            for (const auto& h : gres.full_hits) seen_full.insert({ h.key_id, h.mode });
-
-            // AUTOKEY on front-only (parity with CPU search surface)
-            if (include_autokey)
-            {
-                for (const auto& h : gres.front_hits)
-                {
-                    if (seen_full.find({ h.key_id, h.mode }) != seen_full.end()) continue;
-                    if (h.alphabet_id >= alphabets.size()) continue;
-                    if (h.key_id >= keys_slice.size()) continue;
-
-                    const auto& alphabet = alphabets[h.alphabet_id];
-                    const std::string& key_word = keys_slice[h.key_id];
-                    const std::size_t key_len = key_word.size();
-                    if (!key_len) continue;
-
-                    ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
-                    ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
-                    for (std::size_t i = 0; i < key_len; ++i) {
-                        int idx = alphabet_index(alphabet, key_word[i]);
-                        if (idx < 0) { key_valid[i] = 0; key_indices[i] = 0; }
-                        else { key_valid[i] = 1; key_indices[i] = static_cast<std::uint8_t>(idx); }
-                    }
-
-                    rebuild_cipher_indices(alphabet);
-
-                    ++result.autokey_attempts;
-                    ++autokey_counter;
-
-                    ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
-                    // Use the SAME semantics as your CPU autokey (tail rule)
-                    decrypt_autokey(
-                        cipher_indices.get(),
-                        text_len,
-                        key_indices.get(),
-                        key_len,
-                        autokey_plaintext.get(),
-                        static_cast<Mode>(h.mode));
-
-                    double ioc_auto = 0.0, chi_auto = 0.0;
-                    compute_stats_indices(autokey_plaintext.get(), text_len, alphabet, ioc_auto, chi_auto);
-
-                    if (ioc_auto > IOC_GATE && chi_auto < CHI_GATE) {
-                        std::string plaintext_auto =
-                            build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
-
-                        Candidate cand_auto = make_candidate(
-                            key_word, alphabet, static_cast<Mode>(h.mode),
-                            /*autokey=*/true,
-                            plaintext_auto, preview_length,
-                            spacing_pattern, spacing_words_by_length,
-                            ioc_auto, chi_auto);
-                        maintain_top_results(result.best, cand_auto, 10);
-                    }
-                }
-            }
-
-            // count each key once per processed batch (parity with your prior accounting)
-            ++result.keys_processed;
-            ++keys_counter;
-
-             //periodically merge local best into global
-            if ((a0 / A_BATCH) % 2 == 0) {
-                std::lock_guard<std::mutex> lock(results_mutex);
-                for (const auto& cand : result.best)
-                    maintain_top_results(global_results, cand, max_results);
-            }
-        }
-
-        return result;
+        saw_any_word = true;
+        offset = end;
     }
 
-    // ---- CPU PATH (unchanged) ----
-    {
-        // Outer: alphabets
-        for (std::size_t a = 0; a < alphabet_count; ++a) {
-            const auto& alphabet = alphabets[a];
-
-            // build cipher_indices for this alphabet once
-            for (std::size_t i = 0; i < text_len; ++i) {
-                if (!letter_mask[i]) {
-                    cipher_indices[i] = 0;
-                    continue;
-                }
-                int idx = alphabet_index(alphabet, cipher[i]);
-                cipher_indices[i] = (idx >= 0)
-                    ? static_cast<std::uint8_t>(idx)
-                    : 0;
-            }
-            std::fill(cipher_indices.get() + text_len, cipher_indices.get() + padded_len, 0);
-
-            std::unordered_map<Mode, std::unordered_set<std::uint16_t>> trashBigramMap;
-
-            // Inner: keys assigned to this worker
-            for (std::size_t idx_k = begin; idx_k < end; ++idx_k) {
-                const std::string& key_word = keys[idx_k];
-
-                const std::size_t key_len = key_word.size();
-                ensure_u8_capacity(key_indices, key_indices_capacity, key_len);
-                ensure_u8_capacity(key_valid, key_valid_capacity, key_len);
-                for (std::size_t i = 0; i < key_len; ++i)
-                {
-                    int idx = alphabet_index(alphabet, key_word[i]);
-                    if (idx < 0) {
-                        key_valid[i] = 0;
-                        key_indices[i] = 0;
-                    }
-                    else {
-                        key_valid[i] = 1;
-                        key_indices[i] = static_cast<std::uint8_t>(idx);
-                    }
-                }
-
-                if (key_len == 0) {
-                    continue;
-                }
-
-                std::uint16_t key_bigram_code = 0;
-                bool has_bigram = key_len >= 2;
-                if (has_bigram) {
-                    char a0 = key_word[0];
-                    char b0 = key_word[1];
-                    key_bigram_code = encode_bigram(a0, b0);
-                }
-
-                bool keyblockBuilt = false;
-
-                for (Mode mode : modes)
-                {
-                    ++result.combos;
-                    ++combos_counter;
-
-                    auto& trashSet = trashBigramMap[mode];
-
-                    if (has_bigram && trashSet.find(key_bigram_code) != trashSet.end()) {
-                        continue;
-                    }
-
-                    if ((have_first2_filter || have_second4_filter) &&
-                        !passes_front_filters_repeating(
-                            cipher,
-                            key_word,
-                            alphabet,
-                            mode,
-                            have_first2_filter,
-                            have_second4_filter,
-                            two_letter_set,
-                            four_letter_set,
-                            trashSet))
-                    {
-                        continue; // reject this (key, alphabet, mode) without full decrypt
-                    }
-
-#if defined(__AVX2__)
-                    if (!keyblockBuilt)
-                    {
-                        ensure_keyblock_capacity(key_blocks, key_block_capacity, key_len);
-                        for (std::size_t start = 0; start < key_len; ++start) {
-                            auto& block = key_blocks[start];
-                            for (std::size_t j = 0; j < block.data.size(); ++j) {
-                                block.data[j] = key_indices[(start + j) % key_len];
-                            }
-                        }
-                        keyblockBuilt = true;
-                    }
-#endif
-
-                    decrypt_repeating(
-                        alphabet,
-                        mode,
-                        cipher_indices.get(),
-                        letter_mask.get(),
-                        key_indices.get(),
-                        key_valid.get(),
-                        key_len,
-                        plaintext_indices.get(),
-                        text_len,
-                        padded_len
-#if defined(__AVX2__)
-                        , key_blocks.get()
-#endif
-                    );
-
-                    double ioc, chi;
-                    compute_stats_indices(plaintext_indices.get(), text_len, alphabet, ioc, chi);
-
-                    if (ioc > 0.05 && chi < 160.0)
-                    {
-                        std::string plaintext = build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
-
-                        Candidate cand = make_candidate(
-                            key_word, alphabet, mode, false,
-                            plaintext, preview_length,
-                            spacing_pattern, spacing_words_by_length, ioc, chi);
-                        maintain_top_results(result.best, cand, 10);
-                    }
-
-                    if (include_autokey)
-                    {
-                        ++result.autokey_attempts;
-                        ++autokey_counter;
-
-                        ensure_u8_capacity(autokey_plaintext, autokey_capacity, text_len);
-
-                        decrypt_autokey(
-                            cipher_indices.get(),
-                            text_len,
-                            key_indices.get(),
-                            key_len,
-                            autokey_plaintext.get(),
-                            mode);
-
-                        double ioc_auto = 0.0, chi_auto = 0.0;
-
-                        compute_stats_indices(
-                            autokey_plaintext.get(),
-                            text_len,
-                            alphabet,
-                            ioc_auto,
-                            chi_auto);
-
-                        if (ioc_auto > 0.05 && chi_auto < 160.0)
-                        {
-                            std::string plaintext_auto =
-                                build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
-
-                            Candidate cand_auto = make_candidate(
-                                key_word,
-                                alphabet,
-                                mode,
-                                /*autokey_variant=*/true,
-                                plaintext_auto,
-                                preview_length,
-                                spacing_pattern,
-                                spacing_words_by_length,
-                                ioc_auto,
-                                chi_auto);
-
-                            maintain_top_results(result.best, cand_auto, 10);
-                        }
-                    }
-                }
-            }
-
-            // count each key once (not once per alphabet)
-            ++result.keys_processed;
-            ++keys_counter;
-
-            // merge local best into global periodically
-            if (a % 1000 == 0)
-            {
-                std::lock_guard<std::mutex> lock(results_mutex);
-                for (const auto& cand : result.best) {
-                    maintain_top_results(global_results, cand, max_results);
-                }
-            }
-        }
-
-        return result;
-    }
+    // We at least want one fully covered, valid word for this to be interesting
+    return saw_any_word;
 }
-
-
 
 void progress_loop(const std::atomic<bool> &done, double interval_seconds,
                    std::atomic<std::size_t> &combos_counter,
                    std::atomic<std::size_t> &keys_counter,
                    std::atomic<std::size_t> &autokey_counter,
                    std::size_t total_combos, std::mutex &results_mutex,
-                   std::vector<Candidate> &results, std::size_t max_rows) {
+                   std::vector<Candidate> &results, std::size_t max_rows) 
+{
   using clock = std::chrono::steady_clock;
   const auto start = clock::now();
   while (!done.load(std::memory_order_relaxed)) {
@@ -1638,7 +225,7 @@ void progress_loop(const std::atomic<bool> &done, double interval_seconds,
 
 int main(int argc, char* argv[]) {
     try {
-        Options options = parse_options(argc, argv);
+        Options options = Options::parse_options(argc, argv);
 
 #ifdef __AVX2__
         std::cout << "__AVX2__ is defined\n";
@@ -1646,12 +233,12 @@ int main(int argc, char* argv[]) {
         std::cout << "__AVX2__ is NOT defined\n";
 #endif
 
-        const std::string cipher = clean_letters(options.ciphertext);
+        const std::string cipher = WordlistParser::clean_letters(options.ciphertext);
 
         // --- spacing words (unchanged) ---
         std::vector<std::string> spacing_words;
         if (!options.spacing_wordlist.empty()) {
-            spacing_words = parse_wordlist(options.spacing_wordlist);
+            spacing_words = WordlistParser::parse_wordlist(options.spacing_wordlist);
             if (spacing_words.empty()) {
                 throw std::runtime_error(
                     "Spacing wordlist is empty after cleaning");
@@ -1663,7 +250,7 @@ int main(int argc, char* argv[]) {
         std::unordered_map<int, std::unordered_set<std::string>>
             spacing_words_by_length;
         if (!options.spacing_guide.empty()) {
-            spacing_pattern = parse_spacing_pattern(options.spacing_guide);
+            spacing_pattern = WordlistParser::parse_spacing_pattern(options.spacing_guide);
             if (spacing_pattern.empty()) {
                 throw std::runtime_error(
                     "Spacing guide did not contain any valid word lengths");
@@ -1672,7 +259,7 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error(
                     "Spacing guide requires a spacing wordlist");
             }
-            spacing_words_by_length = build_words_by_length(spacing_words);
+            spacing_words_by_length = WordlistParser::build_words_by_length(spacing_words);
         }
 
         const bool spacing_scoring_enabled =
@@ -1680,7 +267,7 @@ int main(int argc, char* argv[]) {
 
         // --- KEY WORDS: now we add interrupted variants here ---
         std::vector<std::string> key_words =
-            parse_wordlist(options.wordlist,
+            WordlistParser::parse_wordlist(options.wordlist,
                 spacing_pattern.empty() ? nullptr : &spacing_pattern);
 
         if (key_words.empty()) {
@@ -1689,24 +276,24 @@ int main(int argc, char* argv[]) {
 
         // --- alphabet words stay as plain words ---
         const std::vector<std::string> alphabet_words =
-            parse_wordlist(options.alphabet_wordlist);
+            WordlistParser::parse_wordlist(options.alphabet_wordlist);
         if (alphabet_words.empty()) {
             throw std::runtime_error(
                 "Alphabet wordlist is empty after cleaning");
         }
 
         const std::unordered_set<std::uint16_t> two_letter_set =
-            parse_two_letter_list(options.two_letter_list);
+            WordlistParser::parse_two_letter_list(options.two_letter_list);
         const std::unordered_set<std::uint32_t> four_letter_set = !spacing_words.empty()
-            ? build_four_letter_set(spacing_words)
-            : build_four_letter_set(key_words);
+            ? WordlistParser::build_four_letter_set(spacing_words)
+            : WordlistParser::build_four_letter_set(key_words);
 
         const bool have_first2_filter = !two_letter_set.empty();
         const bool have_second4_filter = !four_letter_set.empty();
 
-        std::vector<AlphabetCandidate> alphabets =
-            build_alphabet_candidates(alphabet_words, options);
-        if (alphabets.empty()) {
+        std::vector<AlphabetCandidate> alphabets = AlphabetBuilder::build_alphabet_candidates(alphabet_words, options);
+        if (alphabets.empty()) 
+        {
             throw std::runtime_error("No alphabet candidates generated from wordlist");
         }
 
@@ -1745,7 +332,7 @@ int main(int argc, char* argv[]) {
     std::mutex results_mutex;
 
     std::vector<std::thread> workers;
-    const std::size_t thread_count = std::max<std::size_t>(1, options.threads);
+    const std::size_t thread_count = options.use_cuda ? 1 : std::max<std::size_t>(1, options.threads);
     const std::size_t base_chunk = key_words.size() / thread_count;
     const std::size_t remainder = key_words.size() % thread_count;
 
@@ -1764,31 +351,93 @@ int main(int argc, char* argv[]) {
     auto start_time = std::chrono::steady_clock::now();
 
     std::size_t current = 0;
-    for (std::size_t t = 0; t < thread_count; ++t) {
+    for (std::size_t t = 0; t < thread_count; ++t) 
+    {
       std::size_t chunk = base_chunk + (t < remainder ? 1 : 0);
       std::size_t begin = current;
       std::size_t end = begin + chunk;
       current = end;
-      if (begin >= end) {
+      if (begin >= end) 
+      {
         continue;
       }
-      workers.emplace_back([&, begin, end]() {
-        WorkerResult worker_result = process_keys(
-            key_words, begin, end, cipher, alphabets, modes, two_letter_set,
-            four_letter_set, have_first2_filter, have_second4_filter,
-            spacing_pattern_ptr, spacing_words_ptr,
-            results_limit, options.preview_length, options.include_autokey,
-            options.use_cuda,
-            combos_counter, autokey_counter, keys_counter, results_mutex, global_results);
-        std::lock_guard<std::mutex> lock(results_mutex);
-        for (const auto &cand : worker_result.best) {
-          maintain_top_results(global_results, cand, results_limit);
-        }
-      });
+
+      if (options.use_cuda)
+      {
+          workers.emplace_back([&, begin, end]()
+              {
+                  WorkerResult worker_result = GPUDecode::process_keys(
+                      key_words,
+                      begin,
+                      end,
+                      cipher,
+                      alphabets,
+                      modes,
+                      two_letter_set,
+                      four_letter_set,
+                      have_first2_filter,
+                      have_second4_filter,
+                      spacing_pattern_ptr,
+                      spacing_words_ptr,
+                      results_limit,
+                      options.preview_length,
+                      options.include_autokey,
+                      options.use_cuda,
+                      combos_counter,
+                      autokey_counter,
+                      keys_counter,
+                      results_mutex,
+                      global_results
+                  );
+
+                  std::lock_guard<std::mutex> lock(results_mutex);
+                  for (const auto& cand : worker_result.best)
+                  {
+                      CPUDecode::maintain_top_results(global_results, cand, results_limit);
+                  }
+              });
+      }
+      else
+      {
+          workers.emplace_back([&, begin, end]()
+              {
+                  WorkerResult worker_result = CPUDecode::process_keys_CPU(
+                      key_words,
+                      begin,
+                      end,
+                      cipher,
+                      alphabets,
+                      modes,
+                      two_letter_set,
+                      four_letter_set,
+                      have_first2_filter,
+                      have_second4_filter,
+                      spacing_pattern_ptr,
+                      spacing_words_ptr,
+                      results_limit,
+                      options.preview_length,
+                      options.include_autokey,
+                      options.use_cuda,
+                      combos_counter,
+                      autokey_counter,
+                      keys_counter,
+                      results_mutex,
+                      global_results
+                  );
+
+                  std::lock_guard<std::mutex> lock(results_mutex);
+                  for (const auto& cand : worker_result.best)
+                  {
+                      CPUDecode::maintain_top_results(global_results, cand, results_limit);
+                  }
+              });
+      }
     }
 
-    for (auto &thread : workers) {
-      if (thread.joinable()) {
+    for (auto &thread : workers) 
+    {
+      if (thread.joinable()) 
+      {
         thread.join();
       }
     }
