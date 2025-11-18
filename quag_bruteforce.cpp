@@ -247,9 +247,10 @@ int main(int argc, char* argv[]) {
 
         // --- spacing pattern / guide (unchanged semantics) ---
         std::vector<int> spacing_pattern;
-        std::unordered_map<int, std::unordered_set<std::string>>
-            spacing_words_by_length;
-        if (!options.spacing_guide.empty()) {
+        std::unordered_map<int, std::unordered_set<std::string>> spacing_words_by_length;
+        WordlistParser::SpacingPrefixIndex spacing_prefix_index;
+        if (!options.spacing_guide.empty()) 
+        {
             spacing_pattern = WordlistParser::parse_spacing_pattern(options.spacing_guide);
             if (spacing_pattern.empty()) {
                 throw std::runtime_error(
@@ -260,6 +261,7 @@ int main(int argc, char* argv[]) {
                     "Spacing guide requires a spacing wordlist");
             }
             spacing_words_by_length = WordlistParser::build_words_by_length(spacing_words);
+            spacing_prefix_index = WordlistParser::build_spacing_prefix_index(spacing_words, /*maxPrefixLen=*/2);
         }
 
         const bool spacing_scoring_enabled =
@@ -269,6 +271,12 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> key_words =
             WordlistParser::parse_wordlist(options.wordlist,
                 spacing_pattern.empty() ? nullptr : &spacing_pattern);
+
+        WordlistParser::GlobalPrefixIndex prefixLookup = WordlistParser::build_global_prefix_index(key_words);
+        WordlistParser::QuadgramMap quadMap = WordlistParser::load_quadgram_file("C:\\Users\\10850K\\Desktop\\CODE PROJECTS\\CIPHER TOOLS\\autokeywordlistbruteforce\\Word Lists\\tetra.txt", -24.0);
+        WordlistParser::QuadgramTable quadTable(26 * 26 * 26 * 26, WordlistParser::Q3_QUADGRAM_FLOOR_LOGP);
+        for (auto& kv : quadMap)
+            quadTable[kv.first] = kv.second;
 
         if (key_words.empty()) {
             throw std::runtime_error("Wordlist is empty after cleaning");
@@ -319,13 +327,14 @@ int main(int argc, char* argv[]) {
     std::atomic<std::size_t> autokey_counter{0};
     std::atomic<std::size_t> keys_counter{0};
 
-    const std::size_t results_limit =
-        std::max<std::size_t>(options.max_results, static_cast<std::size_t>(50));
-    const std::vector<int> *spacing_pattern_ptr =
-        spacing_scoring_enabled ? &spacing_pattern : nullptr;
-    const std::unordered_map<int, std::unordered_set<std::string>>
-        *spacing_words_ptr =
-            spacing_scoring_enabled ? &spacing_words_by_length : nullptr;
+    const std::size_t results_limit = std::max<std::size_t>(options.max_results, static_cast<std::size_t>(50));
+    const std::vector<int>* spacing_pattern_ptr = spacing_scoring_enabled ? &spacing_pattern : nullptr;
+    const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_ptr = spacing_scoring_enabled ? &spacing_words_by_length : nullptr;
+
+    const WordlistParser::SpacingPrefixIndex* spacing_prefix_ptr = &spacing_prefix_index;
+    const WordlistParser::GlobalPrefixIndex* key_prefix_map_ptr = &prefixLookup;
+    const WordlistParser::QuadgramTable* quadTable_ptr = &quadTable;
+
 
     std::vector<Candidate> global_results;
     global_results.reserve(results_limit);
@@ -379,6 +388,9 @@ int main(int argc, char* argv[]) {
                       have_second4_filter,
                       spacing_pattern_ptr,
                       spacing_words_ptr,
+                      spacing_prefix_ptr,
+                      key_prefix_map_ptr,
+                      quadTable_ptr,
                       results_limit,
                       options.preview_length,
                       options.include_autokey,

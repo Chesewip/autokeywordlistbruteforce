@@ -128,6 +128,9 @@ struct GPUDecode
         std::size_t text_len,
         const std::vector<int>* spacing_pattern,
         const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
+        const WordlistParser::SpacingPrefixIndex* spacing_prefix_map,
+        const WordlistParser::GlobalPrefixIndex* key_prefix_map,
+        const WordlistParser::QuadgramTable* quadTable_ptr,
         float IOC_GATE,
         float CHI_GATE,
         ProcessHitsForKeysetFn&& process_hits_for_keyset)
@@ -145,6 +148,9 @@ struct GPUDecode
             text_len,
             spacing_pattern,
             spacing_words_by_length,
+            spacing_prefix_map,
+            key_prefix_map,
+            quadTable_ptr,
             IOC_GATE,
             CHI_GATE
         };
@@ -201,6 +207,9 @@ struct GPUDecode
         bool have_second4_filter,
         const std::vector<int>* spacing_pattern,
         const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
+        const WordlistParser::SpacingPrefixIndex* spacing_prefix_map,
+        const WordlistParser::GlobalPrefixIndex* key_prefix_map,
+        const WordlistParser::QuadgramTable* quadTable_ptr,
         std::size_t max_results,
         std::size_t preview_length,
         bool include_autokey,
@@ -407,20 +416,22 @@ struct GPUDecode
 #endif
                 );
 
-                std::string plaintext =
-                    CPUDecode::build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
+                if (h.ioc > IOC_GATE && h.chi < CHI_GATE)
+                {
+                    std::string plaintext = CPUDecode::build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
 
-                const double ioc = static_cast<double>(h.ioc);
-                const double chi = static_cast<double>(h.chi);
+                    const double ioc = static_cast<double>(h.ioc);
+                    const double chi = static_cast<double>(h.chi);
 
-                Candidate cand = Candidate::make_candidate(
-                    key_str, alphabet, static_cast<Mode>(h.mode),
-                    /*autokey=*/false,
-                    plaintext, preview_length,
-                    spacing_pattern, spacing_words_by_length,
-                    ioc, chi);
+                    Candidate cand = Candidate::make_candidate(
+                        key_str, alphabet, static_cast<Mode>(h.mode),
+                        /*autokey=*/false,
+                        plaintext, preview_length,
+                        spacing_pattern, spacing_words_by_length,
+                        ioc, chi);
 
-                CPUDecode::maintain_top_results(result.best, cand, 10);
+                    CPUDecode::maintain_top_results(result.best, cand, 10);
+                }
             }
 
             // Deduplicate autokey on (key_id, mode) that already had a full hit
@@ -443,7 +454,7 @@ struct GPUDecode
             for (const auto& h : gres_local.full_hits)
                 seen_full.insert({ h.key_id, h.mode });
 
-            if (!include_autokey || true)
+            if (!include_autokey)
                 return;
 
             // AUTOKEY on front_hits not already covered by full_hits
@@ -513,7 +524,7 @@ struct GPUDecode
         }; // process_hits_for_keyset
 
         // Mega-batch alphabets per launch (tune). Aim to keep the GPU busy.
-        constexpr std::size_t A_BATCH = 4096; // try 2k–8k depending on VRAM
+        constexpr std::size_t A_BATCH = 8192; // try 2k–8k depending on VRAM
 
         // Process alphabets in chunks of A_BATCH (each with 3 modes per alphabet)
         for (std::size_t a0 = 0; a0 < alphabet_count; a0 += A_BATCH)
@@ -584,7 +595,8 @@ struct GPUDecode
             GpuBatchResult gres =
                 launch_q3_gpu_megabatch(
                     tiles, packed_letters, IOC_GATE, CHI_GATE,
-                    max_full_hits, max_front_hits);
+                    max_full_hits, max_front_hits/*,
+                    quadTable_ptr, false*/);
 
             keys_counter += gres.front_hits.size();
 
@@ -601,7 +613,7 @@ struct GPUDecode
             process_hits_for_keyset(gres, base_key_lookup);
 
             // Phrase search (extracted)
-            if (true)
+            if (false)
             {
                 run_phrase_search_for_batch(
                     keys_slice,
@@ -613,6 +625,9 @@ struct GPUDecode
                     text_len,
                     spacing_pattern,
                     spacing_words_by_length,
+                    spacing_prefix_map,
+                    key_prefix_map,
+                    quadTable_ptr,
                     IOC_GATE,
                     CHI_GATE,
                     process_hits_for_keyset);
