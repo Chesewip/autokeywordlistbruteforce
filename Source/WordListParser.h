@@ -512,4 +512,118 @@ struct WordlistParser
         return table;
     }
 
+
+    using TrigramTable = std::vector<double>; // size 26 * 26 * 26
+
+    static inline std::uint32_t pack_trigram(const std::string& gram)
+    {
+        // gram must be 3 chars 'A'..'Z'
+        int a = gram[0] - 'A';
+        int b = gram[1] - 'A';
+        int c = gram[2] - 'A';
+
+        return ((std::uint32_t)a * 26u + (std::uint32_t)b) * 26u
+            + (std::uint32_t)c;
+    }
+
+    static TrigramTable load_trigram_logcount_table(const std::string& filename)
+    {
+        std::ifstream in(filename);
+        if (!in)
+            throw std::runtime_error("Failed to open file: " + filename);
+
+        constexpr std::size_t TRIGRAM_SPACE = 26u * 26u * 26u;
+        TrigramTable table(TRIGRAM_SPACE, 0.0);
+
+        std::string line;
+        auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+
+        while (std::getline(in, line))
+        {
+            // Trim
+            line.erase(
+                line.begin(),
+                std::find_if(line.begin(), line.end(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }));
+            line.erase(
+                std::find_if(line.rbegin(), line.rend(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }).base(),
+                line.end());
+
+            if (line.empty())
+                continue;
+
+            if (line[0] == '#' || line[0] == ';')
+                continue;
+
+            auto commaPos = line.find(',');
+            if (commaPos == std::string::npos)
+                continue; // malformed
+
+            std::string gram = line.substr(0, commaPos);
+            std::string countStr = line.substr(commaPos + 1);
+
+            // Trim pieces
+            gram.erase(
+                gram.begin(),
+                std::find_if(gram.begin(), gram.end(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }));
+            gram.erase(
+                std::find_if(gram.rbegin(), gram.rend(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }).base(),
+                gram.end());
+
+            countStr.erase(
+                countStr.begin(),
+                std::find_if(countStr.begin(), countStr.end(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }));
+            countStr.erase(
+                std::find_if(countStr.rbegin(), countStr.rend(),
+                    [&](char ch) { return !is_space((unsigned char)ch); }).base(),
+                countStr.end());
+
+            if (gram.size() != 3 || countStr.empty())
+                continue;
+
+            // Normalize to uppercase
+            std::transform(gram.begin(), gram.end(), gram.begin(),
+                [](unsigned char ch) { return (char)std::toupper(ch); });
+
+            bool valid = true;
+            for (char ch : gram)
+            {
+                if (ch < 'A' || ch > 'Z')
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid)
+                continue;
+
+            std::uint64_t count = 0;
+            try
+            {
+                count = std::stoull(countStr);
+            }
+            catch (...)
+            {
+                continue; // malformed count
+            }
+
+            if (count == 0)
+                continue; // your data shouldn’t have this anyway
+
+            std::uint32_t code = pack_trigram(gram);
+            if (code >= TRIGRAM_SPACE)
+                continue; // defensive
+
+            table[code] = std::log(static_cast<double>(count)); // natural log
+            // If you prefer log10, use std::log10 instead.
+        }
+
+        return table;
+    }
+
+
 };

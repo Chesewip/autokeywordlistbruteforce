@@ -17,6 +17,10 @@ namespace {
     __constant__ int d_spacing_len; // number of valid entries in d_spacing_pattern
 
 
+    __device__ double* g_q3_tri_table = nullptr;
+    __device__ uint32_t g_q3_tri_table_size = 0;
+
+
     // 676 bits => 22 uint32_t; 26^4 = 456,976 bits => 14,281 uint32_t
     __constant__ uint32_t c_two_gram_bits[22];
     __constant__ uint32_t c_four_gram_bits[14281];
@@ -25,10 +29,10 @@ namespace {
         const uint32_t idx = uint32_t(a) * 26u + uint32_t(b);
         return (c_two_gram_bits[idx >> 5] >> (idx & 31)) & 1u;
     }
-    __device__ inline bool test4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
-        uint32_t idx = (((uint32_t(a) * 26u + uint32_t(b)) * 26u + uint32_t(c)) * 26u + uint32_t(d));
-        return (c_four_gram_bits[idx >> 5] >> (idx & 31)) & 1u;
-    }
+    //__device__ inline bool test4(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    //    uint32_t idx = (((uint32_t(a) * 26u + uint32_t(b)) * 26u + uint32_t(c)) * 26u + uint32_t(d));
+    //    return (c_four_gram_bits[idx >> 5] >> (idx & 31)) & 1u;
+    //}
 
 
     // ---- Dictionary of allowed words by length, encoded as base-26 codes ----
@@ -45,35 +49,25 @@ namespace {
     __device__ uint32_t* d_word_codes = nullptr;
     __constant__ int     d_word_offsets[8]; // indices for len=0..7 (we use 2..6)
 
-    // ---- Binary search helper ----
+
+    __device__ uint32_t* d_word_bits = nullptr;
+    __constant__ uint32_t d_word_bit_offsets[8]; // bit offsets for len 0..7
+    __constant__ int      d_word_bit_max_len;    // e.g. 5
+
     __device__ __forceinline__
-        bool binary_search_word(uint32_t code, int start, int end, const uint32_t* codes)
+        bool test_dictionary_bitset(int len, uint32_t code)
     {
-        int lo = start;
-        int hi = end - 1;
-        while (lo <= hi)
-        {
-            int mid = (lo + hi) >> 1;
-            uint32_t v = codes[mid];
-            if (v == code) return true;
-            if (v < code)  lo = mid + 1;
-            else           hi = mid - 1;
-        }
-        return false;
-    }
+        if (!d_word_bits) return false;
+        if (len < 2 || len > d_word_bit_max_len) return false;
 
-    // ---- Lookup "does this length-L code exist in the dictionary?" ----
-    __device__ __forceinline__
-        bool test_dictionary_word(int len, uint32_t code)
-    {
-        if (!d_word_codes) return false;      // no table loaded
-        if (len < 2 || len > 6) return false; // we only support 2..6
+        uint32_t base_bit = d_word_bit_offsets[len];
+        uint32_t bit_index = base_bit + code; // code in [0, 26^len)
 
-        int start = d_word_offsets[len];
-        int end = d_word_offsets[len + 1];
-        if (start >= end) return false;       // no words of this length
+        uint32_t word_idx = bit_index >> 5;   // /32
+        uint32_t bit = bit_index & 31u;
+        uint32_t mask = 1u << bit;
 
-        return binary_search_word(code, start, end, d_word_codes);
+        return (d_word_bits[word_idx] & mask) != 0u;
     }
 
     // ---- Check spacing + words, mirroring validate_covered_words() ----
@@ -141,8 +135,8 @@ namespace {
                 code = code * 26u + uint32_t(idx);
             }
 
-            if (!test_dictionary_word(word_len, code))
-                return false; // a fully covered word is NOT in dictionary
+            if (!test_dictionary_bitset(word_len, code))
+                return false;
 
             saw_any = true;
             offset = end;
@@ -182,6 +176,186 @@ namespace {
         uint32_t   front_cap;  // NEW
     };
 
+    __device__ __noinline__ double q3_score_trigram_english_device(
+        const uint8_t* text,
+        int len)
+    {
+        // With log(count) scoring and a dense table, we don’t really need a floor.
+        if (len < 3)
+            return 0.0;
+
+        double* tri_table = g_q3_tri_table;
+        uint32_t size = g_q3_tri_table_size;
+
+        if (!tri_table || size == 0)
+            return 0.0;
+
+        double score = 0.0;
+        int    trigrams = 0;
+
+        // seed with first two letters
+        uint32_t code = static_cast<uint32_t>(text[0]) * 26u
+            + static_cast<uint32_t>(text[1]);
+
+        constexpr uint32_t BASE_26_2 = 26u * 26u;
+
+        for (int i = 2; i < len; ++i)
+        {
+            // slide in the next letter -> 3-letter code in [0, 26^3)
+            code = code * 26u + static_cast<uint32_t>(text[i]);
+
+            if (code < size)
+                score += tri_table[code];
+
+            ++trigrams;
+
+            // keep only the last 2 letters for next step
+            code %= BASE_26_2;
+        }
+
+        if (trigrams == 0)
+            return 0.0;
+
+        return score;
+    }
+
+
+
+    __device__ bool autokey_window_filter(
+        const uint8_t* __restrict__ cipher_idx, // s_cipher (canonical 0..25 indices)
+        const uint8_t* __restrict__ mask,       // s_mask
+        int text_len,
+        const uint8_t* __restrict__ primer,     // canonical 0..25
+        int primer_len,
+        const char* __restrict__ alph,          // s_alph
+        const int8_t* __restrict__ index_map,   // s_index_map
+        uint8_t mode)
+    {
+        // If we have no primer or no trigram table, don't filter at all
+        if (primer_len <= 0)
+            return true;
+
+        if (!g_q3_tri_table || g_q3_tri_table_size == 0)
+            return true;
+
+        constexpr int AUTOKEY_BUFFER_MAX = 42;  // max plaintext we hold per attempt
+        constexpr int AUTOKEY_MAX_OFFSETS = 16;  // how many starting positions to test
+        constexpr int AUTOKEY_MIN_WINDOW = 6;   // minimum window length to bother scoring
+
+        // Base threshold: tuned around some "typical" primer length
+        constexpr int    AUTOKEY_TARGET_WIN = 16;   // window length where base threshold applies
+        constexpr double AUTOKEY_TRI_BASE = 11.5; // your previous tuned trigram avg
+        constexpr double AUTOKEY_TRI_RELAX = 0.0;  // how much more lenient for very short windows
+
+        // Window length = primer length, clamped to buffer
+        int windowLen = primer_len;
+        if (windowLen > AUTOKEY_BUFFER_MAX)
+            windowLen = AUTOKEY_BUFFER_MAX;
+
+        if (windowLen < AUTOKEY_MIN_WINDOW)
+            return true; // not enough letters to get a stable trigram score
+
+        // Dynamic threshold based on windowLen (shorter windows -> more lenient)
+        int effWin = windowLen;
+        if (effWin < AUTOKEY_MIN_WINDOW) effWin = AUTOKEY_MIN_WINDOW;
+        if (effWin > AUTOKEY_TARGET_WIN) effWin = AUTOKEY_TARGET_WIN;
+
+        double t = double(effWin - AUTOKEY_MIN_WINDOW)
+            / double(AUTOKEY_TARGET_WIN - AUTOKEY_MIN_WINDOW);
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+
+        const double dynamic_thresh =
+            AUTOKEY_TRI_BASE - (1.0 - t) * AUTOKEY_TRI_RELAX;
+
+        // Where autokey can start in the ciphertext:
+        // conceptually "right after the primer" region of the static key.
+        constexpr int AUTOKEY_SKIP = 0;
+        const int baseStart = primer_len + AUTOKEY_SKIP;
+        if (baseStart >= text_len)
+            return true; // nowhere to test
+
+        // Try several possible autokey starting offsets
+        for (int offset = 0; offset <= AUTOKEY_MAX_OFFSETS; ++offset)
+        {
+            int start = baseStart + offset;
+            if (start >= text_len)
+                break;
+
+            // Decode exactly windowLen plaintext letters (or bail if we can't)
+            uint8_t plain[AUTOKEY_BUFFER_MAX];
+            int     plain_len = 0;
+
+            // We walk forward in the ciphertext from this start, skipping masked positions.
+            // Keystream for this LOCAL attempt:
+            //  - first primer_len positions: primer[0..primer_len-1]
+            //  - further positions (if any): autokey from plain[]
+            for (int i = start; i < text_len && plain_len < windowLen; ++i)
+            {
+                if (!mask[i])
+                    continue; // masked positions produce no plaintext, no autokey advance
+
+                int j = plain_len; // position in the LOCAL keystream for this attempt
+
+                int key_canon;
+                if (j < primer_len)
+                {
+                    // Seed region: primer supplies keystream
+                    key_canon = primer[j];
+                }
+                else
+                {
+                    // Autokey region: use previously produced plaintext
+                    int idx = j - primer_len;
+                    if (idx < 0 || idx >= plain_len)
+                    {
+                        // Not enough plaintext to continue autokey
+                        plain_len = 0; // clear so we fail this offset cleanly
+                        break;
+                    }
+                    key_canon = plain[idx];
+                }
+
+                int kix = key_canon; // 0..25
+                int km = ((unsigned)kix < 26u) ? int(index_map[kix]) : -1;
+                if (km < 0) km = 0;
+
+                uint8_t p_idx = decrypt_idx(cipher_idx[i], (uint8_t)km, (int)mode);
+                char    ch = alph[p_idx];
+                int     bin = int(ch) - 'A';
+                if ((unsigned)bin >= 26u)
+                    continue; // non A-Z, skip but keep trying to fill the window
+
+                plain[plain_len++] = (uint8_t)bin;
+            }
+
+            // If we couldn't fill the full window, this offset is inconclusive: try next.
+            if (plain_len < windowLen)
+                continue;
+
+            // Score this LOCAL window of length windowLen
+            const double score = q3_score_trigram_english_device(plain, windowLen);
+            const double avg = score / double(windowLen - 2); // avg per trigram
+
+            if (avg >= dynamic_thresh)
+            {
+                // This offset produced a plausible autokey plaintext  keep this candidate
+                return true;
+            }
+
+            // else: bad at this offset  try the next offset
+        }
+
+        // All tested offsets looked like garbage
+        return false;
+    }
+
+
+
+
+
+
+
     __global__ void q3_kernel(const DeviceAlphabetTile* __restrict__ tiles, int num_tiles,
         DeviceKeyLetters keys,
         float ioc_gate, float chi_gate,
@@ -198,6 +372,11 @@ namespace {
         __shared__ int      s_text_len;
         __shared__ uint32_t s_alphabet_id;
         __shared__ uint8_t  s_mode;
+
+        // ---- Early first-6 filter state (from old kernel) ----
+        uint8_t first6[6];
+        int     produced = 0;
+
 
         if (threadIdx.x < N) {
             s_cipher[threadIdx.x] = tiles[tile_id].cipher_idx[threadIdx.x];
@@ -237,6 +416,7 @@ namespace {
         int ki = 0; // rolling key index (no modulo in loop body)
 
 #pragma unroll
+#pragma unroll
         for (int i = 0; i < N; ++i)
         {
             if (i >= s_text_len) break;
@@ -253,11 +433,33 @@ namespace {
             const char    ch = s_alph[p_idx];
             const int     bin = int(ch) - 'A';
 
+            // canonical 0..25 index for *plaintext letter* (as in old first6 logic)
+            uint8_t canonical = (uint8_t)((bin < 0) ? 0 : (bin > 25 ? 25 : bin));
+
+            // preview for host (now using canonical rather than keyed index)
             if (preview_fill < PREVIEW_MAX) {
-                uint8_t canonical = (uint8_t)((bin < 0) ? 0 : (bin > 25 ? 25 : bin));
                 preview[preview_fill++] = canonical;
             }
 
+            // ---- OLD early reject logic: first 2 and then quad in first 6 letters ----
+            if (produced < 6) {
+                first6[produced++] = canonical;
+
+                if (produced == 2) {
+                    if (!test2(first6[0], first6[1])) {
+                        // first bigram not allowed => kill key early
+                        return;
+                    }
+                }
+                //else if (produced == 6) {
+                //    if (!test4(first6[2], first6[3], first6[4], first6[5])) {
+                //        // second word quadgram not allowed => kill key early
+                //        return;
+                //    }
+                //}
+            }
+
+            // histogram
             if ((unsigned)bin < 26u) {
                 my_hist[bin] += 1u;
             }
@@ -314,6 +516,27 @@ namespace {
             }
         };
 
+        bool autokey_ok = true;
+        if (!stats_ok) 
+        {
+            // primer is the first klen chars of preview, but preview might be shorter
+            int primer_len = klen;
+            if (primer_len > preview_fill) primer_len = preview_fill;
+
+            autokey_ok = autokey_window_filter(
+                s_cipher,
+                s_mask,
+                s_text_len,
+                preview,          // canonical 0..25 plaintext from static pass
+                primer_len,
+                s_alph,
+                s_index_map,
+                s_mode);
+
+            if (!autokey_ok)
+                return; // reject this key entirely (never write to front_hits)
+        }
+
         if (stats_ok) {
             uint32_t slot = atomicAdd(out.full_count, 1u);
             if (slot < out.full_cap) {
@@ -357,8 +580,7 @@ void gpu_upload_gram_bitsets(const std::vector<uint32_t>& two_bits,
     CUDA_OK(cudaMemcpyToSymbol(c_four_gram_bits, four_bits.data(), 14281 * sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 }
 
-void gpu_upload_spacing_and_words(const std::vector<int>& spacing_pattern,
-    const WordCodeTable& table)
+void gpu_upload_spacing_and_words(const std::vector<int>& spacing_pattern, const WordCodeTable& table)
 {
     // ---- upload spacing pattern ----
     int h_pattern[MAX_SPACING_WORDS] = { 0 };
@@ -405,6 +627,84 @@ void gpu_upload_spacing_and_words(const std::vector<int>& spacing_pattern,
         0,
         cudaMemcpyHostToDevice));
 }
+
+void gpu_upload_word_bitsets(const std::vector<int>& spacing_pattern,
+    const WordBitsetTable& table,
+    int max_len)
+{
+    // ---- upload spacing pattern ----
+    int h_pattern[MAX_SPACING_WORDS] = { 0 };
+    int len = (int)std::min<std::size_t>(spacing_pattern.size(), MAX_SPACING_WORDS);
+    for (int i = 0; i < len; ++i)
+        h_pattern[i] = spacing_pattern[i];
+
+    CUDA_OK(cudaMemcpyToSymbol(
+        d_spacing_pattern,
+        h_pattern,
+        sizeof(int) * MAX_SPACING_WORDS,
+        0,
+        cudaMemcpyHostToDevice));
+
+    CUDA_OK(cudaMemcpyToSymbol(
+        d_spacing_len,
+        &len,
+        sizeof(int),
+        0,
+        cudaMemcpyHostToDevice));
+
+    // ---- upload bitset table ----
+    uint32_t* d_bits = nullptr;
+    if (!table.bits.empty())
+    {
+        const size_t bytes = table.bits.size() * sizeof(uint32_t);
+        CUDA_OK(cudaMalloc(&d_bits, bytes));
+        CUDA_OK(cudaMemcpy(d_bits,
+            table.bits.data(),
+            bytes,
+            cudaMemcpyHostToDevice));
+    }
+
+    CUDA_OK(cudaMemcpyToSymbol(
+        d_word_bits,
+        &d_bits,
+        sizeof(uint32_t*),
+        0,
+        cudaMemcpyHostToDevice));
+
+    CUDA_OK(cudaMemcpyToSymbol(
+        d_word_bit_offsets,
+        table.offsets.data(),
+        table.offsets.size() * sizeof(uint32_t),
+        0,
+        cudaMemcpyHostToDevice));
+
+    CUDA_OK(cudaMemcpyToSymbol(
+        d_word_bit_max_len,
+        &max_len,
+        sizeof(int),
+        0,
+        cudaMemcpyHostToDevice));
+}
+
+void gpu_upload_q3_trigram_table(const std::vector<double>& hostTable)
+{
+    double* d_ptr = nullptr;
+    uint32_t size32 = static_cast<uint32_t>(hostTable.size());
+
+    if (size32 > 0)
+    {
+        CUDA_OK(cudaMalloc(&d_ptr, size32 * sizeof(double)));
+        CUDA_OK(cudaMemcpy(d_ptr,
+            hostTable.data(),
+            size32 * sizeof(double),
+            cudaMemcpyHostToDevice));
+    }
+
+    // Publish pointer + size to device globals
+    CUDA_OK(cudaMemcpyToSymbol(g_q3_tri_table, &d_ptr, sizeof(d_ptr)));
+    CUDA_OK(cudaMemcpyToSymbol(g_q3_tri_table_size, &size32, sizeof(size32)));
+}
+
 
 
 GpuBatchResult launch_q3_gpu_megabatch(const std::vector<DeviceAlphabetTile>& tiles,

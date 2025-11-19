@@ -22,6 +22,9 @@ struct GPUDecode
     // Small helpers used elsewhere
     // ------------------------------
 
+
+    static inline std::once_flag g_gpu_filter_init_flag;
+
     static uint32_t encode_word_base26(const std::string& w)
     {
         uint32_t code = 0;
@@ -73,6 +76,109 @@ struct GPUDecode
         table.offsets[7] = running; // sentinel for len=6 range end
         return table;
     }
+
+    static WordBitsetTable build_word_bitset_table(
+        const std::unordered_map<int, std::unordered_set<std::string>>& words_by_length,
+        int max_len = 6)
+    {
+        WordBitsetTable t;
+        t.offsets.fill(0);
+
+        // 1) Compute how many bits we need per length
+        uint32_t bit_cursor = 0;
+        for (int len = 2; len <= max_len; ++len)
+        {
+            t.offsets[len] = bit_cursor;
+
+            auto it = words_by_length.find(len);
+            if (it == words_by_length.end())
+                continue;
+
+            // full space is 26^len (but most bits will be 0)
+            uint32_t space = 1;
+            for (int i = 0; i < len; ++i)
+                space *= 26u;               // 26^len
+
+            bit_cursor += space;
+        }
+        t.offsets[max_len + 1] = bit_cursor;
+
+        // 2) Allocate bits
+        uint32_t num_u32 = (bit_cursor + 31u) / 32u;
+        t.bits.assign(num_u32, 0u);
+
+        // 3) Fill bits
+        for (int len = 2; len <= max_len; ++len)
+        {
+            auto it = words_by_length.find(len);
+            if (it == words_by_length.end())
+                continue;
+
+            uint32_t base = t.offsets[len];
+
+            for (const auto& w : it->second)
+            {
+                uint32_t code = GPUDecode::encode_word_base26(w);
+                if (code == UINT32_MAX) continue; // bad word
+                uint32_t bit_index = base + code;
+                uint32_t word_idx = bit_index >> 5;
+                uint32_t bit = bit_index & 31u;
+                t.bits[word_idx] |= (1u << bit);
+            }
+        }
+
+        return t;
+    }
+
+    static void init_gpu_filters(
+        const std::unordered_set<std::uint16_t>& two_letter_set,
+        const std::unordered_set<std::uint32_t>& four_letter_set,
+        const std::vector<int>* spacing_pattern,
+        const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
+        const WordlistParser::TrigramTable* triTable_ptr)
+    {
+        std::call_once(g_gpu_filter_init_flag, [&]()
+            {
+                // ---- 2-gram / 4-gram bitsets -> constant memory ----
+                {
+                    std::vector<std::uint16_t> bigram_codes;
+                    bigram_codes.reserve(two_letter_set.size());
+                    for (auto v : two_letter_set)
+                        bigram_codes.push_back(v);
+
+                    std::vector<std::uint32_t> quad_codes;
+                    quad_codes.reserve(four_letter_set.size());
+                    for (auto v : four_letter_set)
+                        quad_codes.push_back(v);
+
+                    std::vector<std::uint32_t> two_bits, four_bits;
+                    build_bigram_bitset(bigram_codes, two_bits);
+                    build_quadgram_bitset(quad_codes, four_bits);
+                    gpu_upload_gram_bitsets(two_bits, four_bits);
+                }
+
+                // ---- Spacing dictionary -> device global + consts ----
+                if (spacing_pattern && spacing_words_by_length)
+                {
+                    constexpr int MAX_WORD_LEN_FOR_BITSET = 6;
+
+                    WordBitsetTable wtable =
+                        build_word_bitset_table(*spacing_words_by_length,
+                            MAX_WORD_LEN_FOR_BITSET);
+
+                    gpu_upload_word_bitsets(*spacing_pattern,
+                        wtable,
+                        MAX_WORD_LEN_FOR_BITSET);
+                }
+
+                if (triTable_ptr && !triTable_ptr->empty())
+                {
+                    gpu_upload_q3_trigram_table(*triTable_ptr);
+                }
+
+            });
+    }
+
 
     static bool validate_covered_words(
         const std::string& plaintext,
@@ -130,7 +236,7 @@ struct GPUDecode
         const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
         const WordlistParser::SpacingPrefixIndex* spacing_prefix_map,
         const WordlistParser::GlobalPrefixIndex* key_prefix_map,
-        const WordlistParser::QuadgramTable* quadTable_ptr,
+        const WordlistParser::TrigramTable* triTable_ptr,
         float IOC_GATE,
         float CHI_GATE,
         ProcessHitsForKeysetFn&& process_hits_for_keyset)
@@ -150,7 +256,7 @@ struct GPUDecode
             spacing_words_by_length,
             spacing_prefix_map,
             key_prefix_map,
-            quadTable_ptr,
+            triTable_ptr,
             IOC_GATE,
             CHI_GATE
         };
@@ -209,7 +315,7 @@ struct GPUDecode
         const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length,
         const WordlistParser::SpacingPrefixIndex* spacing_prefix_map,
         const WordlistParser::GlobalPrefixIndex* key_prefix_map,
-        const WordlistParser::QuadgramTable* quadTable_ptr,
+        const WordlistParser::TrigramTable* triTable_ptr,
         std::size_t max_results,
         std::size_t preview_length,
         bool include_autokey,
@@ -288,28 +394,6 @@ struct GPUDecode
         // device gates
         constexpr float IOC_GATE = 0.052f;
         constexpr float CHI_GATE = 100.0f;
-
-        // Upload 2-gram / 4-gram filters once per worker
-        {
-            std::vector<std::uint16_t> bigram_codes;
-            bigram_codes.reserve(two_letter_set.size());
-            for (auto v : two_letter_set) bigram_codes.push_back(v);
-
-            std::vector<std::uint32_t> quad_codes;
-            quad_codes.reserve(four_letter_set.size());
-            for (auto v : four_letter_set) quad_codes.push_back(v);
-
-            std::vector<std::uint32_t> two_bits, four_bits;
-            build_bigram_bitset(bigram_codes, two_bits);
-            build_quadgram_bitset(quad_codes, four_bits);
-            gpu_upload_gram_bitsets(two_bits, four_bits);
-        }
-
-        if (spacing_pattern && spacing_words_by_length)
-        {
-            WordCodeTable wtable = build_word_code_table(*spacing_words_by_length);
-            gpu_upload_spacing_and_words(*spacing_pattern, wtable);
-        }
 
         // Slice of keys for this worker [begin,end)
         std::vector<std::string> keys_slice;
@@ -416,22 +500,20 @@ struct GPUDecode
 #endif
                 );
 
-                if (h.ioc > IOC_GATE && h.chi < CHI_GATE)
-                {
-                    std::string plaintext = CPUDecode::build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
 
-                    const double ioc = static_cast<double>(h.ioc);
-                    const double chi = static_cast<double>(h.chi);
+                std::string plaintext = CPUDecode::build_plaintext_string(alphabet, plaintext_indices.get(), text_len);
 
-                    Candidate cand = Candidate::make_candidate(
-                        key_str, alphabet, static_cast<Mode>(h.mode),
-                        /*autokey=*/false,
-                        plaintext, preview_length,
-                        spacing_pattern, spacing_words_by_length,
-                        ioc, chi);
+                const double ioc = static_cast<double>(h.ioc);
+                const double chi = static_cast<double>(h.chi);
 
-                    CPUDecode::maintain_top_results(result.best, cand, 10);
-                }
+                Candidate cand = Candidate::make_candidate(
+                    key_str, alphabet, static_cast<Mode>(h.mode),
+                    /*autokey=*/false,
+                    plaintext, preview_length,
+                    spacing_pattern, spacing_words_by_length,
+                    ioc, chi);
+
+                CPUDecode::maintain_top_results(result.best, cand, 10);
             }
 
             // Deduplicate autokey on (key_id, mode) that already had a full hit
@@ -506,7 +588,7 @@ struct GPUDecode
                     autokey_plaintext.get(), text_len, alphabet,
                     ioc_auto, chi_auto);
 
-                if (ioc_auto > IOC_GATE && chi_auto < CHI_GATE)
+                if (ioc_auto > IOC_GATE && chi_auto <= CHI_GATE)
                 {
                     std::string plaintext_auto =
                         CPUDecode::build_plaintext_string(alphabet, autokey_plaintext.get(), text_len);
@@ -524,7 +606,7 @@ struct GPUDecode
         }; // process_hits_for_keyset
 
         // Mega-batch alphabets per launch (tune). Aim to keep the GPU busy.
-        constexpr std::size_t A_BATCH = 8192; // try 2k–8k depending on VRAM
+        constexpr std::size_t A_BATCH = 4096; // try 2k–8k depending on VRAM
 
         // Process alphabets in chunks of A_BATCH (each with 3 modes per alphabet)
         for (std::size_t a0 = 0; a0 < alphabet_count; a0 += A_BATCH)
@@ -627,7 +709,7 @@ struct GPUDecode
                     spacing_words_by_length,
                     spacing_prefix_map,
                     key_prefix_map,
-                    quadTable_ptr,
+                    triTable_ptr,
                     IOC_GATE,
                     CHI_GATE,
                     process_hits_for_keyset);

@@ -273,10 +273,11 @@ int main(int argc, char* argv[]) {
                 spacing_pattern.empty() ? nullptr : &spacing_pattern);
 
         WordlistParser::GlobalPrefixIndex prefixLookup = WordlistParser::build_global_prefix_index(key_words);
-        WordlistParser::QuadgramMap quadMap = WordlistParser::load_quadgram_file("C:\\Users\\10850K\\Desktop\\CODE PROJECTS\\CIPHER TOOLS\\autokeywordlistbruteforce\\Word Lists\\tetra.txt", -24.0);
-        WordlistParser::QuadgramTable quadTable(26 * 26 * 26 * 26, WordlistParser::Q3_QUADGRAM_FLOOR_LOGP);
-        for (auto& kv : quadMap)
-            quadTable[kv.first] = kv.second;
+        //WordlistParser::QuadgramMap quadMap = WordlistParser::load_quadgram_file("C:\\Users\\10850K\\Desktop\\CODE PROJECTS\\CIPHER TOOLS\\autokeywordlistbruteforce\\Word Lists\\trigrams.txt", -24.0);
+        //WordlistParser::QuadgramTable quadTable(26 * 26 * 26 * 26, WordlistParser::Q3_QUADGRAM_FLOOR_LOGP);
+        WordlistParser::TrigramTable triTable = WordlistParser::load_trigram_logcount_table("C:\\Users\\10850K\\Desktop\\CODE PROJECTS\\CIPHER TOOLS\\autokeywordlistbruteforce\\Word Lists\\trigrams.txt");
+        //for (auto& kv : quadMap)
+        //    quadTable[kv.first] = kv.second;
 
         if (key_words.empty()) {
             throw std::runtime_error("Wordlist is empty after cleaning");
@@ -333,7 +334,9 @@ int main(int argc, char* argv[]) {
 
     const WordlistParser::SpacingPrefixIndex* spacing_prefix_ptr = &spacing_prefix_index;
     const WordlistParser::GlobalPrefixIndex* key_prefix_map_ptr = &prefixLookup;
-    const WordlistParser::QuadgramTable* quadTable_ptr = &quadTable;
+    //const WordlistParser::QuadgramTable* quadTable_ptr = &quadTable;
+    const WordlistParser::TrigramTable* triTable_ptr = &triTable;
+    
 
 
     std::vector<Candidate> global_results;
@@ -373,6 +376,13 @@ int main(int argc, char* argv[]) {
 
       if (options.use_cuda)
       {
+          GPUDecode::init_gpu_filters(
+              two_letter_set,
+              four_letter_set,
+              spacing_pattern_ptr,
+              spacing_words_ptr,
+              triTable_ptr);
+
           workers.emplace_back([&, begin, end]()
               {
                   WorkerResult worker_result = GPUDecode::process_keys(
@@ -390,7 +400,7 @@ int main(int argc, char* argv[]) {
                       spacing_words_ptr,
                       spacing_prefix_ptr,
                       key_prefix_map_ptr,
-                      quadTable_ptr,
+                      triTable_ptr,
                       results_limit,
                       options.preview_length,
                       options.include_autokey,

@@ -17,7 +17,7 @@ namespace PhraseBuilder
     using KeyedWord = std::vector<int>;
 
     constexpr int Q3_PREVIEW_MAX = 80;
-    constexpr int Q3_MAX_PHRASE_WORDS = 4;
+    constexpr int Q3_MAX_PHRASE_WORDS = 10;
     constexpr std::size_t Q3_MAX_PHRASE_GLOBAL_TILE = 5000000;
     constexpr std::size_t MIN_GPU_KEYS_FOR_PHRASES = 16;   // e.g. don’t GPU < 256 keys
     constexpr std::size_t MIN_GPU_TOTAL_CHARS = 64;  // or skip if less than 4k chars
@@ -99,7 +99,7 @@ namespace PhraseBuilder
         const std::unordered_map<int, std::unordered_set<std::string>>* spacing_words_by_length;
         const WordlistParser::SpacingPrefixIndex* spacing_prefix_index_map;
         const WordlistParser::GlobalPrefixIndex* key_prefix_map;
-        const WordlistParser::QuadgramTable* quadTable_ptr;
+        const WordlistParser::TrigramTable* triTable_ptr;
         float IOC_GATE;
         float CHI_GATE;
     };
@@ -306,7 +306,7 @@ namespace PhraseBuilder
         const std::vector<int>& cipher_keyed) // keyed ciphertext [0..25]
     {
         // Tunables
-        constexpr int AUTOKEY_LOOKAHEAD = 16;
+        constexpr int AUTOKEY_LOOKAHEAD = 24;
         constexpr int MIN_PRIMER_FOR_PREVIEW = 8;    // don't preview for very short keys
         constexpr int MIN_PLAIN_FOR_PREVIEW = 8;    // need enough known plaintext
         constexpr double AUTOKEY_THRESH = -5.0;
@@ -454,7 +454,7 @@ namespace PhraseBuilder
             double s = q3_score_quadgram_english(
                 win_plain_canon.data(),
                 wlen,
-                ctx.quadTable_ptr->data());
+                ctx.triTable_ptr->data());
 
             if (s > best)
                 best = s;
@@ -1340,8 +1340,7 @@ namespace PhraseBuilder
                             ctx.CHI_GATE,
                             phrase_full_cap,
                             phrase_front_cap
-                            /*ctx.quadTable_ptr,
-                            true*/);
+                            );
                 }
                 else
                 {

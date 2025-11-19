@@ -56,6 +56,16 @@ struct WordCodeTable
     std::array<int, 8>    offsets{};     // offsets[len]..offsets[len+1]-1 = that length's words
 };
 
+struct WordBitsetTable
+{
+    // offsets[len] gives the starting bit index for words of that length (in bits).
+    // offsets[len+1] is the end.
+    std::array<uint32_t, 8> offsets{}; // we use lengths 2..5 or 6
+
+    // Flat bitvector over all lengths (2..MAX_LEN). Bit i == 1 if code i is present.
+    std::vector<uint32_t> bits; // 32 bits per entry
+};
+
 // Upload prebuilt bigram/quadgram bitsets to constant/device memory (your existing impl)
 void build_bigram_bitset(const std::vector<std::uint16_t>& codes,
     std::vector<std::uint32_t>& bitset_out);
@@ -65,6 +75,10 @@ void gpu_upload_gram_bitsets(const std::vector<std::uint32_t>& bigram_bits,
     const std::vector<std::uint32_t>& quad_bits);
 
 void gpu_upload_spacing_and_words(const std::vector<int>& spacing_pattern, const WordCodeTable& table);
+
+void gpu_upload_word_bitsets(const std::vector<int>& spacing_pattern, const WordBitsetTable& table, int max_len);
+
+void gpu_upload_q3_trigram_table(const std::vector<double>& hostTable);
 
 // New mega-batch launcher (one launch for many alphabets × all 3 modes)
 GpuBatchResult launch_q3_gpu_megabatch(const std::vector<DeviceAlphabetTile>& tiles,
